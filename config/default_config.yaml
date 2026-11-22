@@ -1,0 +1,49 @@
+# Default VPS Configuration
+camera:
+  name: "Sony_IMX296"
+  width: 1456
+  height: 1088
+  fps: 30
+  # Intrinsics: calibrated values (nominal for 6mm lens: fx ~1207, fy ~1199, cx ~728, cy ~544)
+  fx: 1207.2
+  fy: 1199.1
+  cx: 728.0
+  cy: 544.0
+  # Distortion coefficients: [k1, k2, p1, p2, k3]
+  dist_coeffs: [-0.042, 0.015, 0.0008, -0.0004, 0.0]
+  # Vertical baseline distance from camera optical center to landing gear contact plane (meters)
+  baseline_ground_offset_m: 0.15
+
+tracker:
+  max_features: 250
+  quality_level: 0.01
+  min_distance_px: 15.0
+  lk_win_size: [21, 21]
+  lk_max_level: 3
+  forward_backward_thresh_px: 1.0
+  ransac_reproj_thresh_px: 2.0
+  min_keyframe_displacement_px: 10.0
+  min_features_threshold: 15
+
+mavlink:
+  connection_string: "udpin:localhost:14550"
+  baudrate: 921600
+  stream_rate_hz: 100
+  distance_sensor_rate_hz: 15
+  sensor_orientation: "PITCH_270"
+  min_distance_cm: 10
+  max_distance_cm: 30000
+
+fusion:
+  # Process noise
+  q_height: 0.1
+  q_terrain: 0.02
+  # Measurement noise
+  r_baro: 0.5
+  r_vision_base: 0.2
+  min_confidence: 0.3
+  hover_speed_threshold_mps: 0.5
+
+logger:
+  enabled: true
+  output_dir: "logs"

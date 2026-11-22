@@ -255,3 +255,4 @@ class DroneCameraSimulator:
             baro_alt_m=baro_alt,
             groundtruth_h_m=state.altitude_agl_m,
         )
+

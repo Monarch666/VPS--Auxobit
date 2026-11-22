@@ -232,3 +232,4 @@ def _plot_altitude_benchmark(
 
 if __name__ == "__main__":
     run_altitude_benchmark()
+

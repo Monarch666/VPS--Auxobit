@@ -171,3 +171,4 @@ class DeccanTerrainGenerator:
             cv2.imwrite(str(path), img)
 
         return img
+

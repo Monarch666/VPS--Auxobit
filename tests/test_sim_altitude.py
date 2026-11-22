@@ -101,3 +101,4 @@ class TestSimulationBenchmark:
             )
             assert r["confidence"] >= 0.5
             assert r["inliers"] >= 15
+

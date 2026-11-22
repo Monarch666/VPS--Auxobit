@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>vps_ros2</name>
+  <version>1.0.0</version>
+  <description>Visual Positioning System (VPS) Phase 1: Vision-based Height Estimator ROS 2 Wrapper</description>
+  <maintainer email="aadarsh@uav.local">UAV Engineer</maintainer>
+  <license>Proprietary</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

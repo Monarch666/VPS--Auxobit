@@ -69,3 +69,4 @@ class TestFlightLogReplayer:
         # Mean Absolute Error on textured flight slice should be < 0.5 m
         assert res["mae_m"] < 1.0, f"MAE {res['mae_m']:.2f}m exceeds 1.0m limit!"
         assert res["mean_error_pct"] < 5.0, f"Error {res['mean_error_pct']:.2f}% exceeds 5% limit!"
+

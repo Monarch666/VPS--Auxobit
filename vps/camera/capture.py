@@ -26,6 +26,10 @@ class CameraCaptureBase(ABC):
         """Open camera stream."""
         pass
 
+    def start(self) -> bool:
+        """Alias for open()."""
+        return self.open()
+
     @abstractmethod
     def read_frame(self) -> Tuple[bool, Optional[np.ndarray], float]:
         """Read latest frame.
@@ -39,6 +43,10 @@ class CameraCaptureBase(ABC):
     def release(self) -> None:
         """Release camera resources."""
         pass
+
+    def stop(self) -> None:
+        """Alias for release()."""
+        self.release()
 
 
 class OpenCVCameraCapture(CameraCaptureBase):
@@ -155,6 +163,15 @@ class MockCameraCapture(CameraCaptureBase):
             p = Path(image_dir)
             files = sorted(list(p.glob("*.jpg")) + list(p.glob("*.png")))
             self.frames = [cv2.imread(str(f)) for f in files if cv2.imread(str(f)) is not None]
+
+        if len(self.frames) == 0:
+            # Generate default synthetic frames if none provided
+            rng = np.random.default_rng(42)
+            base = np.full((1088, 1456, 3), 130, dtype=np.uint8)
+            self.frames = [
+                np.clip(base.astype(np.int16) + rng.integers(-25, 25, base.shape, dtype=np.int16), 0, 255).astype(np.uint8)
+                for _ in range(5)
+            ]
 
         self.fps = float(fps)
         self.loop = loop

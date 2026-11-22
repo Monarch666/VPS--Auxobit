@@ -137,3 +137,9 @@ class VPSConfig:
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
+
+def load_config(yaml_path: str | Path = Path("config/default_config.yaml")) -> VPSConfig:
+    """Helper function to load VPS configuration from YAML file."""
+    return VPSConfig.from_yaml(yaml_path)
+
+

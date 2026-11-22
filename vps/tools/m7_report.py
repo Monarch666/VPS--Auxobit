@@ -226,3 +226,4 @@ def _plot_master_m7_figure(
 
 if __name__ == "__main__":
     generate_m7_report()
+

@@ -144,3 +144,4 @@ class MAVLinkBridge:
         if self.mav is not None:
             self.mav.close()
             self.mav = None
+

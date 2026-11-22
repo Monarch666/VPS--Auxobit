@@ -16,3 +16,4 @@ EK3_RNG_USE_HGT     -1      # Use rangefinder for terrain/height above ground
 # 3. Companion Computer Telemetry Port (e.g. TELEM2 / SERIAL2 on Flight Controller)
 SERIAL2_PROTOCOL    2       # 2 = MAVLink 2
 SERIAL2_BAUD        921     # 921600 baud rate (high-rate telemetry link)
+

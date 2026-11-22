@@ -97,3 +97,4 @@ class TestSITLIntegration:
         assert res["packets_received"] >= 15
         assert res["ring_buffer_samples"] >= 50
         assert plot_path.is_file()
+

@@ -248,3 +248,4 @@ class TestLoggerAndReplayer:
         assert packets[0].record.frame_idx == 0
         assert math.isclose(packets[4].record.baro_alt_m, 50.4, rel_tol=1e-5)
         assert math.isclose(packets[2].record.pitch_rad, -0.04, rel_tol=1e-5)
+

@@ -149,3 +149,4 @@ class PinholeModel:
             Undistorted image.
         """
         return cv2.undistort(image, self.K, self.D, None, self.K)
+

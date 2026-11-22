@@ -47,3 +47,4 @@ fusion:
 logger:
   enabled: true
   output_dir: "logs"
+

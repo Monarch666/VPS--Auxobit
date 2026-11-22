@@ -108,3 +108,4 @@ def generate_m1_report_plots(output_path: Path):
 
 if __name__ == "__main__":
     generate_m1_report_plots(Path("reports/m1_geometry_validation.png"))
+

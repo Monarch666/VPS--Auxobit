@@ -42,3 +42,4 @@ def test_config_roundtrip(tmp_path):
     assert loaded.camera.fx == 1250.0
     assert loaded.tracker.max_features == 300
     assert loaded.tracker.lk_win_size == (21, 21)
+

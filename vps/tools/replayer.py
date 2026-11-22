@@ -95,3 +95,4 @@ class LogReplayer:
                         frame = cv2.imread(str(img_full_path))
 
                 yield ReplayPacket(record=record, frame=frame)
+

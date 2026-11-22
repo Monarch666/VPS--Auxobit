@@ -177,3 +177,4 @@ class GyroDerotationEngine:
         pts_k_derot = self.derotate_points(pts_k, R_cam)
         flow_trans = pts_c - pts_k_derot
         return pts_k_derot, flow_trans
+

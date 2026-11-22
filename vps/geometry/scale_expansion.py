@@ -224,3 +224,4 @@ class ScaleFromExpansionEngine:
             is_valid=True,
             status_message="Valid scale expansion height estimate"
         )
+

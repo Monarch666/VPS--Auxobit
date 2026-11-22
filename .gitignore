@@ -5,3 +5,7 @@ __pycache__/
 *.log
 logs/
 .vscode/
+data/*.png
+data/*.jpg
+
+

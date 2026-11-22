@@ -34,6 +34,7 @@ class FusionOutput:
     is_hovering: bool
     mode_status: str
     processing_time_ms: float
+    vision_height_m: Optional[float] = None
 
 
 class VPSFusionEngine:
@@ -164,4 +165,5 @@ class VPSFusionEngine:
             is_hovering=is_hover,
             mode_status=state_est.mode_status,
             processing_time_ms=t_elapsed,
+            vision_height_m=(flow_res.height_agl_m if (flow_res.is_valid and flow_res.height_agl_m is not None) else None),
         )

@@ -224,3 +224,4 @@ def _plot_m6_stress_test(
 
 if __name__ == "__main__":
     run_m6_stress_tests()
+

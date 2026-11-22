@@ -16,6 +16,8 @@ from typing import Dict, Any, List, Tuple, Optional
 import socket
 import threading
 import time
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from pymavlink import mavutil
@@ -178,15 +180,14 @@ class MockSITLServer:
 def run_sitl_integration_test(
     duration_s: float = 2.0,
     output_plot_path: Path = Path("reports/m5_mavlink_sitl_report.png"),
+    client_port: int = 14550,
+    server_port: int = 14559,
 ) -> Dict[str, Any]:
     """Execute SITL loopback integration test and generate report plot."""
-    client_port = 14550
-    server_port = 14559
-
     server = MockSITLServer(target_port=client_port, server_port=server_port)
     server.start()
 
-    # Client config to connect to server via standard udpin:localhost:14550
+    # Client config to connect to server via standard udpin:localhost:client_port
     cfg = MAVLinkConfig(
         connection_string=f"udpin:127.0.0.1:{client_port}",
         stream_rate_hz=100,
@@ -202,6 +203,17 @@ def run_sitl_integration_test(
     assert bridge.connect()
     bridge.start()
 
+    # Handshake: wait up to 1.5s for initial inbound packet so UDP connection learns server address
+    t_wait = time.monotonic()
+    while time.monotonic() - t_wait < 1.5:
+        if len(ring_buffer) > 0 and getattr(bridge.mav, "last_address", None) is not None:
+            break
+        time.sleep(0.02)
+
+    # Clear any early packets to accurately measure duration_s
+    with server._lock:
+        server.received_distance_sensors.clear()
+
     # Simulate height updates from VPS
     t_start = time.monotonic()
     t_end = t_start + duration_s
@@ -213,7 +225,7 @@ def run_sitl_integration_test(
         bridge.distance_sender.update_measurement(height_agl_m=h_sim, confidence=conf_sim, covariance_m2=0.02)
         time.sleep(0.02)
 
-    time.sleep(0.15)  # allow packets to settle
+    time.sleep(0.2)  # allow packets to settle
 
     bridge.stop()
     server.stop()
@@ -261,11 +273,11 @@ def _plot_m5_sitl_report(
     # 1. Received Distance vs Time
     if received:
         axs[0, 0].plot(rx_times, dists_m, 'o-', color='navy', markersize=4, label='Received Distance (m)')
+        axs[0, 0].legend()
     axs[0, 0].set_title(f"SITL Received Rangefinder Stream ({rate_hz:.1f} Hz)", fontsize=11, fontweight='bold')
     axs[0, 0].set_xlabel("Time (s)")
     axs[0, 0].set_ylabel("Current Distance (m)")
     axs[0, 0].grid(True, alpha=0.3)
-    axs[0, 0].legend()
 
     # 2. Inter-Packet Interval (Rate Consistency)
     if len(rx_times) > 1:

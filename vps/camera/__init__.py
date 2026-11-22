@@ -1,7 +1,7 @@
 """Camera module for VPS."""
 
 from .capture import CameraCaptureBase, OpenCVCameraCapture, MockCameraCapture
-from .calibration import CheckerboardCalibrator, CalibrationResult, render_synthetic_checkerboard
+from .calibration import CheckerboardCalibrator, CalibrationResult, render_synthetic_checkerboard, load_calibration_yaml
 
 __all__ = [
     "CameraCaptureBase",
@@ -10,5 +10,6 @@ __all__ = [
     "CheckerboardCalibrator",
     "CalibrationResult",
     "render_synthetic_checkerboard",
+    "load_calibration_yaml",
 ]
 

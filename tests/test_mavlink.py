@@ -86,10 +86,34 @@ class TestTelemetryBuffer:
             assert span <= 1.1
 
 
+def _can_bind_loopback() -> bool:
+    """Test if local UDP loopback is permitted in current sandbox/OS environment."""
+    import socket
+    try:
+        s1 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s1.bind(("127.0.0.1", 0))
+        s1.settimeout(0.2)
+        port = s1.getsockname()[1]
+        s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s2.sendto(b"ping", ("127.0.0.1", port))
+        data, _ = s1.recvfrom(32)
+        s1.close()
+        s2.close()
+        return data == b"ping"
+    except Exception:
+        return False
+
+
 class TestSITLIntegration:
+    @pytest.mark.skipif(not _can_bind_loopback(), reason="UDP loopback restricted by sandbox environment")
     def test_sitl_stream_reception(self, tmp_path):
         plot_path = tmp_path / "test_sitl_plot.png"
-        res = run_sitl_integration_test(duration_s=1.5, output_plot_path=plot_path)
+        res = run_sitl_integration_test(
+            duration_s=2.0,
+            output_plot_path=plot_path,
+            client_port=14552,
+            server_port=14561,
+        )
 
         assert res["is_valid"]
         # Must stream at >= 10 Hz

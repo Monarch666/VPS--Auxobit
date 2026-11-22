@@ -2,6 +2,8 @@
 
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2

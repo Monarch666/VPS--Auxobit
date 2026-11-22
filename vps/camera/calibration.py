@@ -175,6 +175,35 @@ class CheckerboardCalibrator:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
 
+def load_calibration_yaml(calibration_path: Path | str) -> Tuple[np.ndarray, np.ndarray]:
+    """Load camera matrix K and distortion coefficients D from YAML file.
+
+    Returns:
+        (K, D) tuple of numpy arrays.
+    """
+    path = Path(calibration_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Calibration file not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    cam = data.get("camera", data)
+    fx = float(cam.get("fx", cam.get("fx_px", 1207.0)))
+    fy = float(cam.get("fy", cam.get("fy_px", 1199.0)))
+    cx = float(cam.get("cx", cam.get("cx_px", 728.0)))
+    cy = float(cam.get("cy", cam.get("cy_px", 544.0)))
+    dist = cam.get("dist_coeffs", [0.0, 0.0, 0.0, 0.0, 0.0])
+
+    K = np.array([
+        [fx, 0.0, cx],
+        [0.0, fy, cy],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    D = np.array(dist, dtype=np.float64)
+    return K, D
+
+
 def render_synthetic_checkerboard(
     pattern_size: Tuple[int, int] = (9, 6),
     square_size_px: int = 40,

@@ -98,3 +98,4 @@ class GroundBaselineCalibrator:
         cfg = VPSConfig.from_yaml(self.config_path)
         cfg.camera.baseline_ground_offset_m = float(baseline_offset_m)
         cfg.to_yaml(self.config_path)
+

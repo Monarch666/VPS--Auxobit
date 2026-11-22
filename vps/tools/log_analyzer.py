@@ -129,3 +129,4 @@ if __name__ == "__main__":
         print(f"  Roll std: {res['roll_std_deg']:.2f} deg | Pitch std: {res['pitch_std_deg']:.2f} deg")
         print(f"  Gyro X std: {res['gyro_x_std_deg_s']:.2f} deg/s | Gyro Y std: {res['gyro_y_std_deg_s']:.2f} deg/s")
         print(f"  RNGFND params: {res['rngfnd_params']}")
+

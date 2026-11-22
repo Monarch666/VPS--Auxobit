@@ -151,3 +151,4 @@ def _plot_m3_results(res: CalibrationResult, sample_img: np.ndarray, output_plot
 
 if __name__ == "__main__":
     run_full_calibration()
+

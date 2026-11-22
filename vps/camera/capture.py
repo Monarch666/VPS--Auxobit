@@ -187,3 +187,4 @@ class MockCameraCapture(CameraCaptureBase):
 
     def release(self) -> None:
         self._is_open = False
+

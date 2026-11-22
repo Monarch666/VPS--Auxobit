@@ -124,3 +124,4 @@ class TestGroundBaselineCalibrator:
         # Noise below baseline clamps cleanly to 0.0 m
         clamped = calibrator.apply_baseline_correction(raw_camera_height_m=0.12, baseline_offset_m=offset)
         assert clamped == 0.0
+

@@ -11,3 +11,4 @@ __all__ = [
     "CalibrationResult",
     "render_synthetic_checkerboard",
 ]
+

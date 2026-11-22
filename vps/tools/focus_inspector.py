@@ -141,3 +141,4 @@ class InfinityFocusInspector:
         cv2.line(overlay, (0, 2 * h // 3), (w, 2 * h // 3), (100, 100, 100), 1)
 
         return overlay
+

@@ -187,3 +187,4 @@ def _plot_m4_benchmark(
 
 if __name__ == "__main__":
     run_m4_benchmark()
+

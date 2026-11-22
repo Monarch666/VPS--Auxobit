@@ -249,3 +249,4 @@ class VisionHeightPipeline:
         if avg_ms <= 0:
             return 30.0
         return 1000.0 / avg_ms
+

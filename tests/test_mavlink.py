@@ -1,0 +1,99 @@
+"""Unit tests for MAVLink telemetry ring buffer, DISTANCE_SENSOR sender, and SITL integration."""
+
+import time
+import numpy as np
+import pytest
+
+from vps.config import MAVLinkConfig
+from vps.mavlink.telemetry_buffer import TelemetryRingBuffer, TelemetrySample
+from vps.tools.sitl_harness import MockSITLServer, run_sitl_integration_test
+
+
+class TestTelemetryBuffer:
+    def test_buffer_interpolation_linear(self):
+        buf = TelemetryRingBuffer(max_duration_s=5.0, time_offset_s=0.0)
+
+        # Insert sample at t=1.0 and t=2.0
+        s0 = TelemetrySample(
+            timestamp_s=1.0,
+            gyro_rad_s=np.array([0.1, 0.2, 0.3]),
+            attitude_rpy_rad=np.array([0.0, 0.0, 0.0]),
+            vel_ned_mps=np.array([10.0, 0.0, 0.0]),
+            baro_alt_m=50.0,
+            pos_ned_m=np.array([0.0, 0.0, -50.0]),
+        )
+        s1 = TelemetrySample(
+            timestamp_s=2.0,
+            gyro_rad_s=np.array([0.3, 0.4, 0.5]),
+            attitude_rpy_rad=np.array([0.2, -0.1, 0.4]),
+            vel_ned_mps=np.array([12.0, 2.0, 0.0]),
+            baro_alt_m=60.0,
+            pos_ned_m=np.array([11.0, 1.0, -60.0]),
+        )
+        buf.add_sample(s0)
+        buf.add_sample(s1)
+
+        # Interpolate at midpoint t=1.5
+        interp = buf.interpolate(1.5)
+        assert interp is not None
+        assert abs(interp.timestamp_s - 1.5) < 1e-6
+        assert abs(interp.baro_alt_m - 55.0) < 1e-5
+        np.testing.assert_allclose(interp.gyro_rad_s, [0.2, 0.3, 0.4], atol=1e-5)
+        np.testing.assert_allclose(interp.vel_ned_mps, [11.0, 1.0, 0.0], atol=1e-5)
+        np.testing.assert_allclose(interp.attitude_rpy_rad, [0.1, -0.05, 0.2], atol=1e-5)
+
+    def test_buffer_yaw_wrap_around(self):
+        """Attitude interpolation should handle -pi to +pi wrap-around cleanly."""
+        buf = TelemetryRingBuffer(max_duration_s=5.0)
+        # s0 yaw is +3.10 rad (~177 deg), s1 yaw is -3.10 rad (~-177 deg)
+        s0 = TelemetrySample(
+            timestamp_s=0.0,
+            gyro_rad_s=np.zeros(3),
+            attitude_rpy_rad=np.array([0.0, 0.0, 3.10]),
+            vel_ned_mps=np.zeros(3),
+            baro_alt_m=10.0,
+        )
+        s1 = TelemetrySample(
+            timestamp_s=1.0,
+            gyro_rad_s=np.zeros(3),
+            attitude_rpy_rad=np.array([0.0, 0.0, -3.10]),
+            vel_ned_mps=np.zeros(3),
+            baro_alt_m=10.0,
+        )
+        buf.add_sample(s0)
+        buf.add_sample(s1)
+
+        interp = buf.interpolate(0.5)
+        assert interp is not None
+        # Shortest angular path wraps through pi, so midpoint should be close to pi or -pi
+        assert abs(abs(interp.attitude_rpy_rad[2]) - np.pi) < 0.15
+
+    def test_buffer_pruning(self):
+        buf = TelemetryRingBuffer(max_duration_s=1.0)
+        # Add samples spanning 2.5 seconds
+        for i in range(25):
+            t = i * 0.1
+            buf.add_sample(TelemetrySample(
+                timestamp_s=t,
+                gyro_rad_s=np.zeros(3),
+                attitude_rpy_rad=np.zeros(3),
+                vel_ned_mps=np.zeros(3),
+                baro_alt_m=10.0,
+            ))
+        # Total duration in buffer should not exceed ~1.0 s
+        with buf._lock:
+            span = buf._samples[-1].timestamp_s - buf._samples[0].timestamp_s
+            assert span <= 1.1
+
+
+class TestSITLIntegration:
+    def test_sitl_stream_reception(self, tmp_path):
+        plot_path = tmp_path / "test_sitl_plot.png"
+        res = run_sitl_integration_test(duration_s=1.5, output_plot_path=plot_path)
+
+        assert res["is_valid"]
+        # Must stream at >= 10 Hz
+        assert res["rate_hz"] >= 10.0
+        assert res["packets_received"] >= 15
+        assert res["ring_buffer_samples"] >= 50
+        assert plot_path.is_file()

@@ -207,3 +207,4 @@ class KeyframeManager:
             is_hovering=is_hover,
             reason="Accumulating baseline"
         )
+

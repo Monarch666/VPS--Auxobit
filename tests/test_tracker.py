@@ -122,3 +122,4 @@ class TestVisionHeightPipeline:
         median_est = float(np.median(estimates))
         # Within 5% error
         assert abs(median_est - alt) / alt < 0.05
+

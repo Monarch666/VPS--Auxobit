@@ -1,0 +1,18 @@
+# ArduPilot Parameter File for VPS Vision-Based Height Estimator
+# Downward Rangefinder configuration via MAVLink DISTANCE_SENSOR
+
+# 1. Primary Rangefinder Configuration
+RNGFND1_TYPE        10      # 10 = MAVLink Rangefinder
+RNGFND1_MIN_CM      10      # 10 cm minimum detection threshold
+RNGFND1_MAX_CM      30000   # 30,000 cm (300 m) maximum detection threshold
+RNGFND1_ORIENT      25      # 25 = MAV_SENSOR_ROTATION_PITCH_270 (Pointing Downward)
+RNGFND1_GNDCLEAR    15      # 15 cm physical ground clearance from camera to landing gear contact plane
+RNGFND1_FILT        0.5     # Rangefinder noise filter factor
+
+# 2. EKF3 Rangefinder Fusion Configuration
+EK3_SRC1_POSZ       2       # 2 = Primary Rangefinder for altitude (or 1 for Baro + Rangefinder fallback)
+EK3_RNG_USE_HGT     -1      # Use rangefinder for terrain/height above ground
+
+# 3. Companion Computer Telemetry Port (e.g. TELEM2 / SERIAL2 on Flight Controller)
+SERIAL2_PROTOCOL    2       # 2 = MAVLink 2
+SERIAL2_BAUD        921     # 921600 baud rate (high-rate telemetry link)

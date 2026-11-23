@@ -18,7 +18,7 @@ def test_default_config_loading():
     assert cfg.camera.fy == 1199.1
     assert cfg.camera.K.shape == (3, 3)
     assert len(cfg.camera.D) == 5
-    assert cfg.camera.baseline_ground_offset_m == 0.15
+    assert cfg.camera.baseline_ground_offset_m == 0.06
 
     assert cfg.tracker.max_features == 250
     assert cfg.tracker.min_keyframe_displacement_px == 10.0

@@ -12,7 +12,7 @@ camera:
   # Distortion coefficients: [k1, k2, p1, p2, k3]
   dist_coeffs: [-0.042, 0.015, 0.0008, -0.0004, 0.0]
   # Vertical baseline distance from camera optical center to landing gear contact plane (meters)
-  baseline_ground_offset_m: 0.15
+  baseline_ground_offset_m: 0.06
 
 tracker:
   max_features: 250
@@ -31,7 +31,7 @@ mavlink:
   stream_rate_hz: 100
   distance_sensor_rate_hz: 15
   sensor_orientation: "PITCH_270"
-  min_distance_cm: 10
+  min_distance_cm: 5
   max_distance_cm: 40000
 
 fusion:

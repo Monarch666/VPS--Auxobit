@@ -44,7 +44,7 @@ class TerrainRelativeKalmanFilter:
         config: Optional[FusionConfig] = None,
         initial_height_m: float = 30.0,
         initial_terrain_m: float = 0.0,
-        baseline_ground_offset_m: float = 0.15,
+        baseline_ground_offset_m: float = 0.06,
     ) -> None:
         """Initialize filter state and covariance matrices."""
         self.cfg = config if config is not None else FusionConfig()

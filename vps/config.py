@@ -22,7 +22,7 @@ class CameraConfig:
     cx: float = 728.0
     cy: float = 544.0
     dist_coeffs: List[float] = field(default_factory=lambda: [-0.042, 0.015, 0.0008, -0.0004, 0.0])
-    baseline_ground_offset_m: float = 0.15
+    baseline_ground_offset_m: float = 0.06
     device_index: Any = 0
 
     @property
@@ -66,7 +66,7 @@ class MAVLinkConfig:
     max_data_age_ms: float = 150.0
     emulate_gps: bool = False
     sensor_orientation: str = "PITCH_270"
-    min_distance_cm: int = 10
+    min_distance_cm: int = 5
     max_distance_cm: int = 40000
 
 

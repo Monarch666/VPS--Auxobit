@@ -331,7 +331,7 @@ class VPSApplication:
                 frame_idx=frame_idx,
             )
 
-            h_agl = max(0.1, fusion_out.height_agl_m)
+            h_agl = max(self.cfg.camera.baseline_ground_offset_m, fusion_out.height_agl_m)
 
             # 5. ES-EKF Vertical Position Update (Height AGL)
             self.ekf.update_height(height_agl_m=h_agl)

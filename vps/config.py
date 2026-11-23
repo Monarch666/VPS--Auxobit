@@ -23,6 +23,7 @@ class CameraConfig:
     cy: float = 544.0
     dist_coeffs: List[float] = field(default_factory=lambda: [-0.042, 0.015, 0.0008, -0.0004, 0.0])
     baseline_ground_offset_m: float = 0.15
+    device_index: Any = 0
 
     @property
     def K(self) -> np.ndarray:

@@ -69,9 +69,7 @@ class VPSApplication:
                 dev_idx = self.cfg.camera.device_index
             self.camera = OpenCVCameraCapture(
                 device_index=dev_idx,
-                width=self.cfg.camera.width,
-                height=self.cfg.camera.height,
-                fps=self.cfg.camera.fps,
+                config=self.cfg.camera,
             )
 
         # 3. Load Calibrated Intrinsics
@@ -146,7 +144,7 @@ class VPSApplication:
             fps_counter += 1
 
             # Interpolate synchronized telemetry matching frame exposure time
-            telem = self.ring_buffer.get_interpolated(t_capture)
+            telem = self.ring_buffer.interpolate(t_capture)
             if telem is not None:
                 self.watchdog.record_telemetry()
             else:
@@ -215,7 +213,7 @@ class VPSApplication:
             meas = self.aruco_validator.detect_and_estimate(frame, timestamp_s=t_capture)
 
             # 2. Query fusion state
-            telem = self.ring_buffer.get_interpolated(t_capture)
+            telem = self.ring_buffer.interpolate(t_capture)
             if telem is not None:
                 self.watchdog.record_telemetry()
             else:

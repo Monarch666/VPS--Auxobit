@@ -94,6 +94,7 @@ class OdometrySender:
         innovation_chi2: float = 0.0,
         frame_timestamp_s: float = 0.0,
         reset_counter: int = 0,
+        gyro_rad_s: Optional[np.ndarray] = None,
     ) -> HealthStatus:
         """Update current navigation state from ES-EKF.
 
@@ -145,7 +146,7 @@ class OdometrySender:
             pos_ned_m=nav_state.pos_ned_m.copy(),
             vel_ned_mps=nav_state.vel_ned_mps.copy(),
             quat_wb=nav_state.quat_wb.copy(),
-            gyro_rad_s=nav_state.gyro_bias_rad_s.copy(),  # rates or biases
+            gyro_rad_s=gyro_rad_s.copy() if gyro_rad_s is not None else np.zeros(3, dtype=np.float64),
             pose_cov_21=pose_cov_21,
             vel_cov_21=vel_cov_21,
             confidence=confidence,

@@ -74,7 +74,7 @@ class VisionHeightPipeline:
             fy=self.cam_cfg.fy,
             min_displacement_px=self.trk_cfg.min_keyframe_displacement_px,
             min_altitude_m=0.1,
-            max_altitude_m=350.0,
+            max_altitude_m=450.0,  # operational ceiling 400m + margin
         )
         self.keyframe_mgr = KeyframeManager(
             fx=self.cam_cfg.fx,

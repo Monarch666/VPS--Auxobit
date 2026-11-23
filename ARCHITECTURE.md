@@ -1,195 +1,194 @@
-# Visual Positioning System (VPS) - Phase 1: Height (AGL) Estimator
-## System Architecture & Mathematical Specification
+# Visual Positioning System (VPS) - Phase 1 (Height AGL) & Phase 2 (Horizontal GNSS-Denied Navigation)
+## System Architecture & Mathematical Specification (10 m to 400 m AGL)
 
 ---
 
 ### 1. High-Level System Architecture
 
-The VPS Phase 1 system estimates Above Ground Level (AGL) height by fusing downward-looking monocular vision with flight controller telemetry.
+The VPS system provides autonomous navigation in GNSS-denied environments. It combines high-rate relative visual-inertial state estimation with periodic absolute georeferenced satellite map matching, operating on a Raspberry Pi 5 companion computer connected to an ArduPilot flight controller.
 
 ```mermaid
 graph TD
-    subgraph Sensors & Flight Controller
-        CAM["Sony IMX296 Camera<br/>(1456x1088 @ 30 fps)"]
-        FC["ArduPilot Flight Controller<br/>(MAVLink Serial / UDP)"]
+    subgraph Sensors & Hardware [Physical Layer]
+        CAM["Sony IMX296 Global Shutter Camera<br/>(1456x1088 @ 30 fps / 728x544 tracking)"]
+        FC["ArduPilot Flight Controller<br/>(MAVLink 2 Serial @ 921,600 baud)"]
+        IMU_COMPASS["Sensors: IMU (Gyro/Accel), Compass (Mag), Baro"]
     end
 
-    subgraph Hardware & Telemetry Ingestion
-        CAP["Camera Driver / Capture<br/>(V4L2 / OpenCV / PiCamera2)"]
-        TS_BUF["Telemetry Ring Buffer<br/>(Interpolation @ Frame Exposure)"]
-        MAV_IN["MAVLink Telemetry Receiver<br/>(ATTITUDE, HIGHRES_IMU, LOCAL_POS, SCALED_PRESSURE)"]
+    subgraph Ingestion & Synchronization [Core 0 & Shared Memory]
+        CAP["Camera Driver / Zero-Copy Ingestion<br/>(libcamera / Picamera2 / V4L2)"]
+        SYNC["Hardware Clock Synchronization<br/>(CLOCK_MONOTONIC to FC via TIMESYNC)"]
+        TS_BUF["Telemetry Ring Buffer (100 Hz)<br/>(ATTITUDE, HIGHRES_IMU, COMPASS, VFR_HUD)"]
     end
 
-    subgraph Computer Vision Core [No ROS Dependency]
-        UNDIST["Lens Undistortion Engine<br/>(Equidistant / RadTan K, D)"]
-        TRACK["Feature Tracker<br/>(Shi-Tomasi + Pyramidal LK + Fwd-Bkwd + RANSAC)"]
-        KEY["Adaptive Keyframe Selector<br/>(Metric Baseline >= 10 px)"]
-        DEROT["Gyro De-rotation Engine<br/>(H = K * R * K^-1)"]
-        SCALE_EXP["Scale-from-Expansion Engine<br/>(Vertical Velocity: s1/s2 + dH)"]
-        FLOW_HEIGHT["Height-from-Flow Engine<br/>(f_px * |v_ground * dt| / |d_flow|)"]
+    subgraph Phase 1: Height (AGL) Estimation [Core 1]
+        TRACK["Pyramidal LK Feature Tracker<br/>(Shi-Tomasi + NEON + Forward-Backward)"]
+        KEY["Adaptive Keyframe Selector<br/>(Metric Baseline >= 10 px for 10-400m)"]
+        DEROT["Gyro De-rotation Engine<br/>(H_rot = K * R * K^-1)"]
+        SCALE_EXP["Scale-from-Expansion Engine<br/>(Vertical: s1/s2 + dH_baro)"]
+        HEIGHT_KF["2-State Height Kalman Filter<br/>State: [h_AGL, z_terrain]^T"]
+        HOVER_HOLD["Hover / Low-Texture Fallback<br/>(Hold z_terrain, inflate covariance)"]
     end
 
-    subgraph State Estimation & Fusion
-        CONF["Confidence & Health Evaluator<br/>(Inliers, Flow, Speed, AngRate)"]
-        KF["2-State Kalman Filter<br/>State: [h_AGL, z_terrain]^T"]
-        FALLBACK["Hover / Low-Texture Fallback<br/>(Terrain Elevation Hold)"]
+    subgraph Phase 2: Horizontal Navigation [Core 1, 2, 3]
+        VIO_ENG["Visual Odometry Engine<br/>(Metric velocity v = flow * h / f_px)"]
+        ES_EKF["Error-State EKF (15-State)<br/>Pos N/E, Vel N/E, Attitude, Accel/Gyro Bias"]
+        MAP_DB["GeoTIFF Tiled Map Database<br/>(Multi-scale descriptors & gradients)"]
+        MAP_MATCH["Absolute Map Matcher<br/>(Orthorectify + ORB/AKAZE + RANSAC + Phase Corr)"]
+        DELAY_FUSION["Delayed-State Fusion Engine<br/>(State history buffer + Innovation Chi-Square Gating)"]
     end
 
-    subgraph Outputs & Interfaces
-        MAV_OUT["MAVLink Sender<br/>(DISTANCE_SENSOR @ >= 10 Hz)"]
-        LOG["Synchronized Telemetry & Video Logger"]
-        ROS2["Optional Thin ROS 2 Node<br/>(sensor_msgs/Range)"]
+    subgraph Safety & Output Dispatcher [Core 3]
+        HEALTH["System Health Gate<br/>(Thermal, Undervoltage, Latency, Confidence)"]
+        DIST_OUT["MAVLink DISTANCE_SENSOR (>= 15 Hz)"]
+        ODOM_OUT["MAVLink ODOMETRY / VISION / GPS_INPUT (20-30 Hz)"]
+        LOG["Synchronized Telemetry & Video Logger (NVMe/SSD)"]
+        ROS2["Optional Decoupled ROS 2 Wrapper Node"]
     end
 
-    CAM --> CAP --> UNDIST --> TRACK
-    FC --> MAV_IN --> TS_BUF
+    CAM --> CAP --> SYNC --> TRACK
+    FC --> IMU_COMPASS --> TS_BUF
+    TS_BUF --> SYNC
     TS_BUF --> DEROT
-    TS_BUF --> FLOW_HEIGHT
-    TS_BUF --> SCALE_EXP
-    TS_BUF --> KF
+    TS_BUF --> ES_EKF
 
-    TRACK --> KEY --> DEROT --> FLOW_HEIGHT --> CONF
-    TRACK --> SCALE_EXP --> CONF
-    CONF --> KF
-    FALLBACK <--> KF
+    TRACK --> KEY --> DEROT --> HEIGHT_KF
+    TRACK --> SCALE_EXP --> HEIGHT_KF
+    HOVER_HOLD <--> HEIGHT_KF
 
-    KF --> MAV_OUT --> FC
-    KF --> LOG
-    KF --> ROS2
+    HEIGHT_KF --> VIO_ENG
+    DEROT --> VIO_ENG
+    VIO_ENG --> ES_EKF
+
+    ES_EKF -.->|Search Window Window & Prior| MAP_MATCH
+    HEIGHT_KF -.->|Scale Factor| MAP_MATCH
+    TS_BUF -.->|Heading & Tilt| MAP_MATCH
+    MAP_DB --> MAP_MATCH
+    MAP_MATCH --> DELAY_FUSION --> ES_EKF
+
+    HEIGHT_KF --> DIST_OUT --> FC
+    ES_EKF --> HEALTH --> ODOM_OUT --> FC
+    HEIGHT_KF & ES_EKF --> LOG
+    HEIGHT_KF & ES_EKF --> ROS2
 ```
 
 ---
 
 ### 2. Mathematical Formulations & Coordinate Frames
 
-#### 2.1 Coordinate Frames
-- **World Frame ($W$)**: Local NED (North-East-Down) or geographic frame.
+#### 2.1 Coordinate Conventions
+- **World Navigation Frame ($W$)**: Local NED (North-East-Down), origin at mission start or EKF origin.
 - **Body Frame ($B$)**: Drone structural frame (X forward, Y right, Z down).
-- **Camera Frame ($C$)**: Optical frame with Z forward (downward relative to drone), X right, Y down.
+- **Camera Frame ($C$)**: Optical frame with Z pointing forward along optical axis (downward relative to drone), X pointing right, Y pointing down.
 - **Image Plane**: Pixel coordinates $(u, v)$ with origin at top-left.
 
-#### 2.2 Pinhole Optics & Ground Sample Distance (GSD)
-For calibrated focal lengths $(f_x, f_y)$ and AGL altitude $H$:
-$$GSD_x = \frac{H}{f_x}, \quad GSD_y = \frac{H}{f_y}$$
-At max altitude $H = 300\text{ m}$ and $f_x \approx 1207\text{ px}$:
-$$GSD \approx \frac{300}{1207} \approx 0.2485\text{ m/px} \approx 25\text{ cm/px}$$
+#### 2.2 Pinhole Optics & Ground Sample Distance (GSD) across 10 m to 400 m
+For focal length $f_{px} \approx 1207\text{ px}$ (full resolution) or $603.5\text{ px}$ (half resolution $728 \times 544$):
+$$\text{GSD} = \frac{H}{f_{px}}$$
 
-#### 2.3 Gyro-Based Frame De-Rotation
-Between keyframe $t_k$ and current frame $t_c$, relative camera rotation $R_{k \to c} \in SO(3)$ is obtained by integrating high-rate gyro angular velocities $\boldsymbol{\omega}_{IMU}$:
+| Altitude AGL ($H$) | Full GSD ($1456\times 1088$) | Scaled GSD ($728\times 544$) | Flow at 10 m/s (1 frame @ 30 fps) | $10\text{ px}$ Baseline Ground Distance |
+|:---|:---|:---|:---|:---|
+| **$10\text{ m}$** | $0.83\text{ cm/px}$ | $1.66\text{ cm/px}$ | $40.2\text{ px}$ | $0.083\text{ m}$ ($8.3\text{ cm}$) |
+| **$30\text{ m}$** | $2.48\text{ cm/px}$ | $4.96\text{ cm/px}$ | $13.4\text{ px}$ | $0.25\text{ m}$ |
+| **$60\text{ m}$** | $4.97\text{ cm/px}$ | $9.94\text{ cm/px}$ | $6.7\text{ px}$ | $0.50\text{ m}$ |
+| **$100\text{ m}$** | $8.28\text{ cm/px}$ | $16.56\text{ cm/px}$ | $4.0\text{ px}$ | $0.83\text{ m}$ |
+| **$200\text{ m}$** | $16.57\text{ cm/px}$ | $33.14\text{ cm/px}$ | $2.0\text{ px}$ | $1.66\text{ m}$ |
+| **$300\text{ m}$** | $24.85\text{ cm/px}$ | $49.70\text{ cm/px}$ | $1.3\text{ px}$ | $2.49\text{ m}$ |
+| **$400\text{ m}$** | $33.14\text{ cm/px}$ | $66.28\text{ cm/px}$ | $1.0\text{ px}$ | $3.31\text{ m}$ |
+
+#### 2.3 Gyro-Based Frame De-Rotation Homography
+Between keyframe timestamp $t_k$ and current frame $t_c$, relative camera rotation $R_{k \to c} \in SO(3)$ is obtained by integrating high-rate gyro angular velocities:
 $$R_{k \to c} = \exp\left( \int_{t_k}^{t_c} [\boldsymbol{\omega}_C(t)]_\times dt \right)$$
 The infinite homography mapping pixels from frame $t_k$ to $t_c$ induced solely by rotation is:
 $$H_{rot} = K R_{k \to c} K^{-1}$$
-For feature point $\mathbf{p}_k$ in keyframe $k$, its purely rotated position in current frame is:
-$$\tilde{\mathbf{p}}_{k,derot} = H_{rot} \tilde{\mathbf{p}}_k$$
-The residual image displacement between tracked feature $\mathbf{p}_c$ and $\tilde{\mathbf{p}}_{k,derot}$ is purely translational:
-$$\Delta \mathbf{p}_{trans} = \mathbf{p}_c - \mathbf{p}_{k,derot}$$
+For feature point $\mathbf{p}_k$, its purely rotated projection in the current frame is $\tilde{\mathbf{p}}_{k,derot} = H_{rot} \tilde{\mathbf{p}}_k$.
+The residual vector is purely translational ground motion:
+$$\Delta \mathbf{p}_{trans} = \mathbf{p}_c - \tilde{\mathbf{p}}_{k,derot}$$
 
-#### 2.4 Height from Keyframe De-Rotated Optical Flow
-Given ground displacement $\Delta \mathbf{d}_{ground} = \int_{t_k}^{t_c} \mathbf{v}_{ground}(t) dt$ (from EKF ground velocity):
+#### 2.4 Height from Keyframe De-Rotated Flow (10 m to 400 m)
+With ground translation $\|\Delta \mathbf{d}_{ground}\| = \left\|\int_{t_k}^{t_c} \mathbf{v}_{ground}(t) dt\right\|$:
 $$H = f_{px} \cdot \frac{\|\Delta \mathbf{d}_{ground}\|}{\|\Delta \mathbf{p}_{trans}\|}$$
-To maintain high signal-to-noise ratio:
-- Keyframes are triggered when accumulated baseline ground distance guarantees $\|\Delta \mathbf{p}_{trans}\| \ge 10\text{ px}$.
-- At $300\text{ m}$ altitude and $10\text{ m/s}$ speed, $10\text{ px}$ corresponds to $\Delta d \approx 2.48\text{ m}$ ($\Delta t \approx 0.25\text{ s}$).
+The Adaptive Keyframe Manager enforces:
+$$\|\Delta \mathbf{d}_{ground}\| \ge \frac{10 \cdot H_{prior}}{f_{px}}$$
+- At $10\text{ m}$: baseline $= 8.3\text{ cm}$ ($\Delta t \approx 8\text{ ms}$ @ $10\text{ m/s}$ $\rightarrow$ triggers almost every frame).
+- At $400\text{ m}$: baseline $= 3.31\text{ m}$ ($\Delta t \approx 330\text{ ms}$ @ $10\text{ m/s}$ $\rightarrow$ triggers every ~10 frames).
 
-#### 2.5 Scale from Feature Expansion during Climb/Descent
-During vertical climb or descent ($\Delta H = H_1 - H_2 \ne 0$), image scale expands or contracts.
-For feature pairs $(i, j)$ with distances $d_1(i, j)$ at $t_1$ and $d_2(i, j)$ at $t_2$:
-$$\text{Scale Ratio } s = \frac{s_1}{s_2} = \frac{\text{median}(d_1)}{\text{median}(d_2)} = \frac{H_2}{H_1}$$
-With barometric altimetry difference $\Delta H = H_1 - H_2$ (independent of terrain):
-$$H_1 = \frac{\Delta H}{1 - s_1/s_2}, \quad H_2 = H_1 - \Delta H$$
-
-#### 2.6 2-State Kalman Filter Formulation
+#### 2.5 2-State Height Kalman Filter (State: $[h_{AGL}, z_{terrain}]^T$)
 State vector:
-$$\mathbf{x} = \begin{bmatrix} h_{AGL} \\ z_{terrain} \end{bmatrix}$$
-Where baro-referenced altitude $a = h_{AGL} + z_{terrain}$.
-
-**State Prediction**:
-Driven by down-velocity $v_D$ from flight controller:
-$$\begin{bmatrix} \dot{h}_{AGL} \\ \dot{z}_{terrain} \end{bmatrix} = \begin{bmatrix} -v_D \\ 0 \end{bmatrix} + \mathbf{w}$$
-$$\mathbf{F} = \begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}, \quad \mathbf{B} = \begin{bmatrix} -\Delta t \\ 0 \end{bmatrix}, \quad \mathbf{Q} = \begin{bmatrix} q_{h} \Delta t & 0 \\ 0 & q_{terrain} \Delta t \end{bmatrix}$$
-
-**Measurement Models**:
-1. **Barometer Altitude**:
-   $$z_{baro} = \begin{bmatrix} 1 & 1 \end{bmatrix} \mathbf{x} + v_{baro}$$
-2. **Vision Height Measurement** (from Flow or Scale Expansion):
-   $$z_{vis} = \begin{bmatrix} 1 & 0 \end{bmatrix} \mathbf{x} + v_{vis}$$
-   where measurement covariance $R_{vis}$ is scaled dynamically by inverse confidence $\frac{1}{\text{conf}^2}$.
-
-**Degraded / Hover Mode**:
-When vision confidence falls below threshold (e.g. forward speed $< 0.5\text{ m/s}$ and no vertical motion, or feature count $< 15$):
-- Vision updates are disabled.
-- Terrain elevation $z_{terrain}$ is held constant with gradual covariance inflation $q_{terrain}$.
-- Output height is propagated as $h_{AGL} = a_{baro} - z_{terrain}$.
+$$\mathbf{x} = \begin{bmatrix} h_{AGL} \\ z_{terrain} \end{bmatrix}, \quad a_{baro} = h_{AGL} + z_{terrain}$$
+- **Kinematic Prediction**: Driven by vertical velocity $v_D$:
+  $$\mathbf{x}_{k|k-1} = \mathbf{F} \mathbf{x}_{k-1} + \mathbf{B} v_D, \quad \mathbf{F} = \mathbf{I}_2, \quad \mathbf{B} = \begin{bmatrix} -\Delta t \\ 0 \end{bmatrix}$$
+- **Barometer Update**:
+  $$z_{baro} = \begin{bmatrix} 1 & 1 \end{bmatrix} \mathbf{x} + v_{baro}$$
+- **Vision Height Update**:
+  $$z_{vis} = \begin{bmatrix} 1 & 0 \end{bmatrix} \mathbf{x} + v_{vis}, \quad R_{vis} = \frac{R_{base}}{C^2}$$
+- **Hover & Textureless Fallback**: When horizontal speed $< 0.5\text{ m/s}$ or image contrast is lost:
+  $$\dot{z}_{terrain} = 0, \quad q_{terrain} \leftarrow 10 \cdot q_{terrain}, \quad h_{AGL} = a_{baro} - z_{terrain}$$
 
 ---
 
-### 3. Software Modular Decomposition
+### 3. Phase 2: Horizontal Navigation & Absolute Map Matching
 
-```
-e:\VPS\
-├── config/
-│   ├── default_config.yaml       # Master configuration (camera, mavlink, tracker, kf)
-│   ├── imx296_calib_default.yaml # Default intrinsics (fx 1207, fy 1199, etc.)
-│   └── sitl_params.param         # ArduPilot parameter reference for distance sensor
-├── vps/
-│   ├── __init__.py
-│   ├── config.py                 # Dataclasses & YAML schema loader
-│   ├── camera/
-│   │   ├── __init__.py
-│   │   ├── capture.py            # Generic V4L2 / Mock video capture
-│   │   └── calibration.py        # Checkerboard / ChArUco calibrator
-│   ├── tracker/
-│   │   ├── __init__.py
-│   │   ├── feature_tracker.py    # Shi-Tomasi + LK optical flow + forward-backward
-│   │   └── keyframe_manager.py   # Adaptive baseline keyframe selector
-│   ├── geometry/
-│   │   ├── __init__.py
-│   │   ├── pinhole.py            # Undistort, reprojection, GSD
-│   │   ├── derotation.py         # SO(3) integration & homography K*R*K^-1
-│   │   ├── height_flow.py        # Height from de-rotated optical flow
-│   │   └── scale_expansion.py    # Height from vertical expansion ratio
-│   ├── mavlink/
-│   │   ├── __init__.py
-│   │   ├── connection.py         # Async MAVLink reader/writer (pymavlink)
-│   │   ├── telemetry_buffer.py   # Interpolation ring buffer for timestamp matching
-│   │   └── distance_sender.py    # DISTANCE_SENSOR message formatter
-│   ├── fusion/
-│   │   ├── __init__.py
-│   │   ├── kalman_filter.py      # 2-state EKF [h_agl, z_terrain]
-│   │   └── confidence.py         # Multi-factor confidence metric
-│   ├── tools/
-│   │   ├── __init__.py
-│   │   ├── logger.py             # High-speed telemetry + frame sync logger
-│   │   ├── replayer.py           # Log playback engine
-│   │   ├── simulator.py          # Synthetic aerial pinhole simulator
-│   │   ├── focus_inspector.py    # Infinity-focus verification tool
-│   │   ├── baseline_calibrator.py# Ground baseline height offset calibration
-│   │   └── aruco_validator.py    # Low-altitude (< 30 m) ground truth validator
-│   └── ros2/                     # Thin optional ROS 2 node wrapper
-│       ├── __init__.py
-│       └── vps_node.py
-├── tests/
-│   ├── __init__.py
-│   ├── test_geometry.py          # Unit tests for pinhole, derotation, height formulas
-│   ├── test_tracker.py           # Unit tests for LK flow & keyframing
-│   ├── test_kalman.py            # Unit tests for 2-state filter & terrain hold
-│   ├── test_mavlink.py           # Unit tests for MAVLink packing & ring buffer
-│   └── test_sim_altitude.py      # Automated benchmark across 30 m to 300 m
-├── ARCHITECTURE.md
-├── PLAN.md
-└── RULES.md
-```
+#### 3.1 Relative Visual-Inertial Odometry (VIO)
+Given estimated height $h_{AGL}$, metric horizontal velocity in the camera frame is:
+$$\mathbf{v}_{C,xy} = \frac{h_{AGL}}{f_{px} \cdot \Delta t} \Delta \mathbf{p}_{trans}$$
+Transforming from camera optical frame to drone body frame ($B$):
+$$\mathbf{v}_{B} = R_{C}^B \mathbf{v}_C$$
+Combined with compass heading $\psi_{compass}$ and pitch/roll attitude, velocity in local NED frame is:
+$$\mathbf{v}_{NED} = R_{B}^W(\phi, \theta, \psi) \mathbf{v}_B$$
+
+#### 3.2 Error-State Extended Kalman Filter (ES-EKF)
+State vector (15 states):
+$$\delta \mathbf{x} = [\delta \mathbf{p}_{NED}, \delta \mathbf{v}_{NED}, \delta \boldsymbol{\theta}, \delta \mathbf{b}_a, \delta \mathbf{b}_g]^T$$
+- **IMU Propagation (100 Hz)**: Integrates high-rate accelerometer and gyro measurements.
+- **Compass Update**: Magnetometer yaw innovation constrains heading drift.
+- **VIO Velocity Update (30 Hz)**: Fuses metric visual velocity.
+
+#### 3.3 Absolute Map Matching via Georeferenced Orthophoto
+1. **Offline Preparation**: Ingests high-resolution GeoTIFF orthomosaic of the flight operational area (Aurangabad Deccan region), builds multi-scale image pyramids, and pre-extracts ORB/AKAZE descriptors.
+2. **Runtime Orthorectification**: Live camera frame is transformed into a nadir, North-aligned, map-scaled image:
+   $$H_{rect} = S_{GSD} \cdot R_{yaw}(\psi) \cdot K_{map} \cdot R_{tilt}(\phi, \theta) \cdot K^{-1}$$
+3. **Feature Matching**: Matches live orthorectified image against local candidate map tiles.
+4. **Delayed-State EKF Update**:
+   Because map matching requires $50-150\text{ ms}$:
+   - The filter maintains a sliding state history buffer.
+   - When a valid match is confirmed at timestamp $t_{match}$, the measurement update is applied to the historical state at $t_{match}$.
+   - Subsequent IMU and VIO measurements are re-propagated forward to the current time $t_{now}$.
+5. **Outlier Rejection**:
+   Normalized innovation squared test ($\chi^2$ gating):
+   $$d^2 = \boldsymbol{\nu}^T (\mathbf{H} \mathbf{P} \mathbf{H}^T + \mathbf{R})^{-1} \boldsymbol{\nu} \le \chi^2_{p=0.01}$$
+   Outliers are rejected and logged; covariance is inflated gracefully if fixes are unavailable.
 
 ---
 
-### 4. Hardware Constraints & Timing Budgets
+### 4. Raspberry Pi 5 Multi-Process Architecture & Resource Budget
 
-| Metric | Target | Rationale |
-| :--- | :--- | :--- |
-| **Camera FPS** | 30 fps (33.3 ms/frame) | Sony IMX296 hardware framerate |
-| **Processing Budget** | $\le 25\text{ ms/frame}$ | Enables $\ge 25\text{ fps}$ throughput on Raspberry Pi 5 / Jetson Orin |
-| **End-to-End Latency**| $< 100\text{ ms}$ | Shutter exposure midpoint to MAVLink `DISTANCE_SENSOR` dispatch |
-| **MAVLink Output Rate**| $10 - 20\text{ Hz}$ | ArduPilot rangefinder driver optimal ingestion rate |
-| **Telemetry Ingest Rate**| $\ge 50 - 100\text{ Hz}$ | Required for accurate gyro inter-frame de-rotation integration |
-| **Altitude Dynamic Range**| $0.1\text{ m}$ to $300\text{ m}$ AGL | Hand-held baseline ($0.1-2\text{ m}$) up to max flight ceiling ($300\text{ m}$) |
+```
+ +---------------------------------------------------------------------------------------------------+
+ |                                RASPBERRY PI 5 COMPANION COMPUTER                                  |
+ |                                                                                                   |
+ |   CORE 0: Ingestion & TimeSync         CORE 1: Vision Tracking & Height AGL                       |
+ |   - libcamera zero-copy capture        - Shi-Tomasi feature tracking (NEON)                       |
+ |   - CLOCK_MONOTONIC timestamping       - Gyro de-rotation homography                              |
+ |   - MAVLink TIMESYNC clock sync        - 2-State Kalman Filter ([h_agl, z_terrain]^T)             |
+ |   - CPU load: ~10-15%                  - CPU load: ~25-30%                                        |
+ |                          \                  /                                                     |
+ |                           Shared Memory IPC                                                       |
+ |                          /                  \                                                     |
+ |   CORE 2: Absolute Map Matching        CORE 3: Sensor Fusion & MAVLink Dispatch                   |
+ |   - GeoTIFF tile retrieval             - 15-State ES-EKF (VIO + IMU + Compass)                    |
+ |   - Orthorectification & matching      - MAVLink ODOMETRY / DISTANCE_SENSOR dispatch              |
+ |   - Delayed-state correction           - Thermal / undervoltage health monitor                    |
+ |   - CPU load: ~15-20% (1-2 Hz)         - CPU load: ~10-15%                                        |
+ +---------------------------------------------------------------------------------------------------+
+```
 
+| Pipeline Stage | Frequency | Target Latency | CPU Budget (Pi 5) | Optimization Strategy |
+|:---|:---|:---|:---|:---|
+| **Camera Capture** | 30 Hz | $< 5\text{ ms}$ | $< 10\%$ Core 0 | Zero-copy V4L2/libcamera ring buffer |
+| **Optical Flow & De-Rotation** | 30 Hz | $< 25\text{ ms}$ | $< 30\%$ Core 1 | Capped features (300-500), $728\times 544$ resolution, ARM NEON |
+| **Height Kalman Fusion** | 30 Hz | $< 2\text{ ms}$ | $< 5\%$ Core 1 | Analytical Joseph-form covariance update |
+| **VIO Velocity Recovery** | 30 Hz | $< 3\text{ ms}$ | $< 5\%$ Core 1 | Direct projection from height & de-rotated flow |
+| **Map Matching** | 1–2 Hz | $< 150\text{ ms}$ | $< 20\%$ Core 2 | Asynchronous worker process, tiled spatial indexing |
+| **MAVLink I/O & Health** | 100 Hz | $< 2\text{ ms}$ | $< 10\%$ Core 3 | Thread-safe serial socket @ 921,600 baud |
+| **Total System Budget** | — | **$< 100\text{ ms}$** | **$< 80\%$** across 4 cores | Multi-process core pinning (`os.sched_setaffinity`) |

@@ -1,4 +1,4 @@
-# Engineering & Operational Rules for VPS Phase 1
+# Engineering & Operational Rules for VPS (Phase 1 & Phase 2)
 
 ---
 
@@ -16,26 +16,28 @@
 ### Rule 3: Execution Environment & Multi-Platform Compatibility
 1. **Laptop-First Verification**:
    - Every module, tool, unit test, and simulator must run and pass locally on this laptop (Windows / Python 3.10+) before considering deployment.
-2. **Raspberry Pi 5 Target Alignment**:
-   - The primary target companion computer is **Raspberry Pi 5** (ARM64 / Linux) connected to the flight controller (ArduPilot) via serial UART.
-   - Jetson Orin is also supported via configurable assumptions.
-   - Avoid architecture-specific proprietary binaries. Rely on standard Python, NumPy, OpenCV, and pymavlink.
-   - Video capture must support standard OpenCV V4L2 and mock streams, with clear configuration for PiCamera2 / V4L2 on Raspberry Pi OS.
+2. **Raspberry Pi 5 Target Alignment (Design for Pi 5 from Day 1)**:
+   - The primary target companion computer is **Raspberry Pi 5** (ARM64 / Linux, 4-core Cortex-A76, NO GPU/CUDA) connected to ArduPilot via serial UART at 921,600 baud.
+   - Budget constraints: tracking loop $\ge 25\text{ fps}$, end-to-end latency $< 100\text{ ms}$, map matching $\ge 1\text{ Hz}$, total CPU $< 80\%$.
+   - Multi-process pipeline with shared memory IPC (`multiprocessing.shared_memory`) and core pinning (`os.sched_setaffinity`).
+   - Run tracking at reduced resolution ($728 \times 544$, scale intrinsics accordingly), cap features (300–500), use OpenCV with NEON optimization.
+   - Power and thermal monitoring: poll undervoltage and CPU throttling flags (`vcgencmd get_throttled`).
 
-### Rule 4: Physical Testing & Hand-Held Baseline Height
-1. **Hand-Held Ground Calibration**:
+### Rule 4: Dynamic Altitude Envelope (10 m to 400 m AGL) & Hand-Held Testing
+1. **10 m to 400 m Operating Envelope**:
+   - Optical flow, adaptive keyframing, and GSD calculations must be valid across $10\text{ m}$ to $400\text{ m}$ AGL.
+2. **Hand-Held Ground Baseline Zeroing**:
    - Physical testing will involve holding the drone by hand and raising/lowering it to verify AGL measurements.
-   - The system must incorporate a baseline ground calibration offset (vertical distance from camera optical center to landing gear/ground contact plane when resting or held at baseline).
-   - Low-altitude estimation ($0.1\text{ m} - 2\text{ m}$) must handle ground baseline offset accurately so resting on the ground measures 0.0 m AGL.
+   - The system must incorporate a calibrated ground baseline offset ($15\text{ cm}$ clearance from camera optical center to landing gear contact plane).
+   - Low-altitude estimation ($0.1\text{ m} - 2\text{ m}$) must subtract the ground baseline offset so resting on the ground measures exactly $0.000\text{ m}$ AGL.
 
-### Rule 5: Scope & Architectural Boundaries
-1. **Phase 1 Height (AGL) Exclusivity**:
-   - Phase 1 scope is strictly vertical height (AGL) estimation.
-   - Do NOT implement horizontal position estimation or visual odometry in Phase 1.
-   - Keep internal data structures, state vectors, and tracker interfaces modular and extensible for Phase 2 integration.
-2. **Zero ROS Dependency in Core**:
-   - Core libraries (`vps.camera`, `vps.tracker`, `vps.geometry`, `vps.mavlink`, `vps.fusion`, `vps.tools`) must have **zero** ROS / ROS 2 dependencies.
-   - The ROS 2 node is an optional, decoupled, thin wrapper scheduled exclusively for Milestone 8.
+### Rule 5: Phase Boundaries & Sensor Modalities
+1. **Phase 1 (Height AGL) vs Phase 2 (Horizontal GNSS-Denied Navigation)**:
+   - Do NOT start Phase 2 until Phase 1 simulator acceptance criteria are met and approved by the user.
+2. **Sensor Modalities**:
+   - Ingest IMU (high-rate gyro + accel), Compass (magnetometer heading / FC yaw), and VIO (visual-inertial odometry), alongside baro.
+3. **Zero ROS Dependency in Core**:
+   - Core libraries must have **zero** ROS / ROS 2 dependencies. The ROS 2 node is an optional decoupled wrapper.
 
 ### Rule 6: Code Quality & Mathematical Rigor
 1. **Type Annotations & Documentation**:
@@ -43,11 +45,10 @@
 2. **No Invented Intrinsics**:
    - Never hardcode or invent camera intrinsics. Always load from calibrated YAML configuration files.
 3. **Deterministic Unit Testing**:
-   - Mathematical modules (de-rotation, undistortion, height-from-flow, scale-expansion, Kalman filter) must be verified via unit tests with known analytic ground truth.
+   - Mathematical modules must be verified via unit tests with known analytic ground truth.
 
 ### Rule 7: Milestone Governance & Approval Gate
 1. **Step-by-Step Approval Protocol**:
-   - Work strictly in designated milestones (M1 through M8).
+   - Work strictly in designated milestones (M1 through M12).
    - After completing each milestone, provide a concise summary of results, generated plots/metrics, and open questions.
    - **Always halt and wait for explicit user approval before proceeding to code the next milestone.**
-

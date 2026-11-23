@@ -1,0 +1,46 @@
+[Unit]
+Description=Visual Positioning System (VPS) GNSS-Denied Navigation Service
+Documentation=https://github.com/your-org/VPS
+After=network.target local-fs.target systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=notify
+User=pi
+Group=dialout
+WorkingDirectory=/home/pi/VPS
+ExecStart=/home/pi/VPS/venv/bin/python -m vps.main --config /home/pi/VPS/config/default_config.yaml --connection /dev/ttyAMA0:921600 --camera /dev/video0 --mode flight
+
+# Process Supervision and Automated Recovery
+Restart=on-failure
+RestartSec=3s
+TimeoutStartSec=30s
+TimeoutStopSec=10s
+
+# Hardware Watchdog Protocol (petted every 5s by WatchdogSupervisor)
+WatchdogSec=10s
+
+# Deterministic Real-Time Priority and CPU Pinning
+# Pin VPS pipeline to Cores 1, 2, 3 (leaving Core 0 dedicated to OS kernel interrupts and networking)
+CPUAffinity=1,2,3
+Nice=-10
+LimitRTPRIO=50
+LimitMEMLOCK=infinity
+
+# Security & Sandbox Hardening
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/pi/VPS/data/logs /home/pi/VPS/data/map_db
+DeviceAllow=/dev/video0 rw
+DeviceAllow=/dev/ttyAMA0 rw
+DeviceAllow=/dev/watchdog rw
+DeviceAllow=/dev/vchiq rw
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vps-nav
+
+[Install]
+WantedBy=multi-user.target
+

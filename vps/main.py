@@ -32,6 +32,7 @@ from vps.mavlink.telemetry_buffer import TelemetryRingBuffer, TelemetrySample
 from vps.mavlink.connection import MAVLinkBridge
 from vps.fusion.fusion_engine import VPSFusionEngine
 from vps.tools.aruco_validator import ArUcoValidator, ArUcoMarkerConfig
+from vps.health.watchdog import WatchdogSupervisor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -99,6 +100,9 @@ class VPSApplication:
             ),
         )
 
+        # 6. Hardware Watchdog and Supervisor
+        self.watchdog = WatchdogSupervisor()
+
     def start(self) -> bool:
         """Start hardware devices and telemetry streams."""
         logger.info("Starting Visual Positioning System...")
@@ -119,6 +123,8 @@ class VPSApplication:
             logger.error("Failed to open camera device %s", self.cfg.camera.device_index)
             return False
 
+        # Start Watchdog Supervisor
+        self.watchdog.start()
         self._running = True
         return True
 
@@ -135,12 +141,15 @@ class VPSApplication:
                 time.sleep(0.002)
                 continue
 
+            self.watchdog.record_frame()
             frame_idx += 1
             fps_counter += 1
 
             # Interpolate synchronized telemetry matching frame exposure time
             telem = self.ring_buffer.get_interpolated(t_capture)
-            if telem is None:
+            if telem is not None:
+                self.watchdog.record_telemetry()
+            else:
                 # Default kinematic state if telemetry hasn't arrived yet
                 telem = TelemetrySample(
                     timestamp_s=t_capture,
@@ -199,6 +208,7 @@ class VPSApplication:
                 time.sleep(0.005)
                 continue
 
+            self.watchdog.record_frame()
             frame_idx += 1
 
             # 1. Check for ArUco ground marker
@@ -206,7 +216,9 @@ class VPSApplication:
 
             # 2. Query fusion state
             telem = self.ring_buffer.get_interpolated(t_capture)
-            if telem is None:
+            if telem is not None:
+                self.watchdog.record_telemetry()
+            else:
                 telem = TelemetrySample(timestamp_s=t_capture, gyro_rad_s=np.zeros(3), attitude_rpy_rad=np.zeros(3), vel_ned_mps=np.zeros(3), baro_alt_m=0.0)
 
             fusion_out = self.fusion_engine.process_telemetry_and_frame(
@@ -257,6 +269,7 @@ class VPSApplication:
             return
         logger.info("Shutting down VPS...")
         self._running = False
+        self.watchdog.stop()
         self.camera.stop()
         self.mavlink_bridge.stop()
         logger.info("VPS shutdown complete.")

@@ -102,7 +102,7 @@ class MapMatcher:
             return MapMatchResult(
                 timestamp_s=timestamp_s,
                 is_valid=False,
-                pos_ned_m=pos_prior_ned_m[:2].copy(),
+                pos_ned_m=np.array(pos_prior_ned_m[:2], dtype=np.float64),
                 cov_ned_m2=np.eye(2) * (100.0 ** 2),
                 confidence=0.0,
                 match_method="NONE",
@@ -334,7 +334,7 @@ class MapMatcher:
         return MapMatchResult(
             timestamp_s=timestamp_s,
             is_valid=False,
-            pos_ned_m=pos_prior_ned_m[:2].copy(),
+            pos_ned_m=np.array(pos_prior_ned_m[:2], dtype=np.float64),
             cov_ned_m2=np.eye(2) * (150.0 ** 2),
             confidence=0.0,
             match_method="NONE",

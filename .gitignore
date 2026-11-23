@@ -9,6 +9,7 @@ data/*.png
 data/*.jpg
 data/calibration_samples/
 data/flight_logs/
+data/map_db/
 *.tiff
 *.tif
 reports/*.png

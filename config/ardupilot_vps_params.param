@@ -1,0 +1,57 @@
+# ==============================================================================
+# ArduPilot 4.5.7 Parameters for Visual Positioning System (VPS) Integration
+# Target Hardware: MicroAir 405v2 Flight Controller
+# Companion Computer: Raspberry Pi 5 over UART (SERIAL2 / TELEM2) at 921600 baud
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Serial Port Communication Configuration (UART / Telem2)
+# ------------------------------------------------------------------------------
+SERIAL2_PROTOCOL 2       # MAVLink 2 protocol
+SERIAL2_BAUD     921     # 921600 baud rate for low-latency 25 Hz ODOMETRY stream
+
+# ------------------------------------------------------------------------------
+# 2. EKF3 Source Selection for GNSS-Denied Navigation
+# ------------------------------------------------------------------------------
+AHRS_EKF_TYPE    3       # Use EKF3 as primary attitude/navigation estimator
+EK3_ENABLE       1       # Enable EKF3 estimator
+
+# Source Set 1: Vision-Based Positioning (Primary GNSS-Denied Flight Mode)
+EK3_SRC1_POSXY   6       # ExternalNav (MAVLink ODOMETRY or VISION_POSITION_ESTIMATE)
+EK3_SRC1_VELXY   6       # ExternalNav (MAVLink ODOMETRY linear velocities)
+EK3_SRC1_POSZ    2       # Barometer altitude (or 6 for ExternalNav height)
+EK3_SRC1_YAW     1       # Compass heading (or 6 for ExternalNav yaw)
+
+# Source Set 2: Fallback (Optical Flow / Baro / Compass)
+EK3_SRC2_POSXY   0       # None
+EK3_SRC2_VELXY   0       # None
+EK3_SRC2_POSZ    2       # Barometer
+EK3_SRC2_YAW     1       # Compass
+
+# ------------------------------------------------------------------------------
+# 3. Visual Odometry (VISO) Integration Parameters
+# ------------------------------------------------------------------------------
+VISO_TYPE        1       # 1 = MAVLink Vision Position / Odometry
+VISO_ORIENT      0       # 0 = Nadir downward orientation (Yaw matches Body)
+VISO_POS_X       0.05    # X position offset from CG (meters, positive forward)
+VISO_POS_Y       0.00    # Y position offset from CG (meters, positive right)
+VISO_POS_Z       0.10    # Z position offset from CG (meters, positive down to camera lens)
+VISO_DELAY_MS    50      # Expected companion vision pipeline latency (ms)
+
+# ------------------------------------------------------------------------------
+# 4. Downward Rangefinder / DISTANCE_SENSOR Configuration (Phase 1 AGL Height)
+# ------------------------------------------------------------------------------
+RNGFND1_TYPE     10      # 10 = MAVLink Rangefinder (receives DISTANCE_SENSOR packets)
+RNGFND1_ORIENT   25      # 25 = MAV_SENSOR_ROTATION_PITCH_270 (downward facing)
+RNGFND1_MIN_CM   10      # 10 cm minimum detection altitude
+RNGFND1_MAX_CM   40000   # 400 m (40000 cm) maximum detection altitude (10m - 400m envelope)
+RNGFND1_GNDCLEAR 15      # 15 cm landing gear clearance baseline offset
+
+# ------------------------------------------------------------------------------
+# 5. EKF3 Glitch Gates & Noise Thresholds
+# ------------------------------------------------------------------------------
+EK3_POS_GATE     500     # ExternalNav position innovation gate size (standard deviations)
+EK3_VEL_GATE     500     # ExternalNav velocity innovation gate size
+EK3_VISO_DELAY   50      # Additional EKF buffer delay for vision (ms)
+EK3_GLITCH_RAD   25      # Radius (meters) beyond which EKF ignores external nav glitch
+

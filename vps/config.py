@@ -58,6 +58,12 @@ class MAVLinkConfig:
     baudrate: int = 921600
     stream_rate_hz: int = 100
     distance_sensor_rate_hz: int = 15
+    odometry_rate_hz: int = 25
+    odometry_mode: str = "ODOMETRY"  # "ODOMETRY", "VISION_POSITION_ESTIMATE", "GPS_INPUT"
+    feed_fc_ekf: bool = False  # Safety interlock: default False (ADVISORY_LOG_ONLY)
+    min_confidence_to_feed: float = 0.40
+    max_data_age_ms: float = 150.0
+    emulate_gps: bool = False
     sensor_orientation: str = "PITCH_270"
     min_distance_cm: int = 10
     max_distance_cm: int = 40000

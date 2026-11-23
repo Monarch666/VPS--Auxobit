@@ -663,6 +663,38 @@ class TestE2EIntegration:
         assert app.ring_buffer is not None
         assert app.watchdog is not None
         assert app.aruco_validator is not None
+        # Phase 2 subsystems
+        assert app.ekf is not None
+        assert app.vio_est is not None
+        assert app.vio_tracker is not None
+        assert app.vio_derot is not None
+
+    def test_main_app_autonomous_flight_loop(self):
+        """E2E: VPSApplication starts and runs full autonomous flight loop with mock camera."""
+        from vps.main import VPSApplication
+        import threading
+
+        cfg = VPSConfig()
+        cfg.camera.device_index = "mock"
+        cfg.mavlink.connection_string = "udpin:127.0.0.1:19998"
+
+        app = VPSApplication(config=cfg)
+        started = app.start()
+        assert started, "VPSApplication failed to start"
+        assert app.mavlink_bridge.odometry_sender is not None
+
+        # Let the autonomous flight loop run for 0.3 seconds in a thread
+        t = threading.Thread(target=app.run_autonomous_flight, daemon=True)
+        t.start()
+        time.sleep(0.3)
+
+        app.stop()
+        t.join(timeout=1.0)
+
+        # Verify that states and covariances remain clean
+        assert np.all(np.isfinite(app.ekf.state.pos_ned_m)), "NaN in EKF position"
+        assert np.all(np.isfinite(app.ekf.state.vel_ned_mps)), "NaN in EKF velocity"
+        assert np.all(np.isfinite(app.ekf.P)), "NaN in EKF covariance"
 
 
 if __name__ == "__main__":

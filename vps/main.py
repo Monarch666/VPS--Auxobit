@@ -1,23 +1,33 @@
 """Visual Positioning System (VPS) - Master Production Daemon.
 
-Entrypoint for standalone operation on Raspberry Pi 5 companion computer or host PC:
-1. Initializes camera capture (OpenCV V4L2 / Sony IMX296 / Mock).
-2. Connects to ArduPilot via MAVLink (UART serial or UDP loopback).
-3. Executes real-time vision-based height estimation:
-   - Pyramidal LK optical flow + Shi-Tomasi features
+Full-stack production daemon for Raspberry Pi 5 companion computer and host PC:
+1. Camera capture: Sony IMX296 global shutter / OpenCV V4L2 / Mock simulator.
+2. ArduPilot bidirectional MAVLink: UART serial or UDP loopback.
+3. Phase 1 Height (AGL):
+   - Pyramidal Lucas-Kanade optical flow + Shi-Tomasi feature tracking
    - High-rate gyro de-rotation (H = K * R * K^-1)
    - 2-State Kalman Filter ([h_agl, z_terrain]^T)
    - Hover / stationary loiter terrain hold
-4. Dispatches MAVLink DISTANCE_SENSOR packets to ArduPilot EKF at >= 15 Hz.
-5. Supports interactive hand-held testing HUD mode with landing-gear baseline zeroing.
+   - MAVLink DISTANCE_SENSOR packets at >= 15 Hz
+4. Phase 2 GNSS-Denied Horizontal Navigation:
+   - Metric VIO horizontal velocity estimation (v = flow * h / f_px)
+   - 15-State Error-State EKF (Position, Velocity, Attitude, Accel/Gyro Bias)
+   - Offline Sentinel-2 GeoTIFF tiled map database with sub-2ms LRU lookup
+   - Asynchronous Nadir Frame Orthorectifier & Multi-Scale Map Matcher (1-2 Hz)
+   - Delayed-State EKF fusion with latency compensation & chi^2 innovation gating
+   - MAVLink ODOMETRY / VISION_POSITION_ESTIMATE output at 25 Hz
+5. System Safety & Reliability:
+   - HealthMonitor safety interlocks (covariance inflation & advisory gating)
+   - Hardware Watchdog Supervisor
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any, List
 import argparse
 import logging
 import signal
 import sys
+import threading
 import time
 import numpy as np
 import cv2
@@ -31,8 +41,16 @@ from vps.camera.calibration import load_calibration_yaml
 from vps.mavlink.telemetry_buffer import TelemetryRingBuffer, TelemetrySample
 from vps.mavlink.connection import MAVLinkBridge
 from vps.fusion.fusion_engine import VPSFusionEngine
+from vps.tracker.feature_tracker import FeatureTracker
+from vps.geometry.derotation import GyroDerotationEngine
+from vps.nav_ekf.es_ekf import ErrorStateEKF, ESEKFConfig, NavState
+from vps.vio.velocity_estimator import VIOVelocityEstimator
+from vps.map_db.runtime_lookup import RuntimeMapDB
+from vps.map_matcher.orthorectifier import FrameOrthorectifier
+from vps.map_matcher.matcher import MapMatcher
 from vps.tools.aruco_validator import ArUcoValidator, ArUcoMarkerConfig
 from vps.health.watchdog import WatchdogSupervisor
+from vps.health.health_monitor import HealthMonitor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,7 +61,7 @@ logger = logging.getLogger("VPS")
 
 
 class VPSApplication:
-    """Master runtime coordinator for VPS autonomous height estimation."""
+    """Master runtime coordinator for VPS autonomous height estimation and horizontal navigation."""
 
     def __init__(self, config: VPSConfig, connection_override: Optional[str] = None) -> None:
         self.cfg = config
@@ -83,7 +101,7 @@ class VPSApplication:
             self.cfg.camera.dist_coeffs = [float(x) for x in D.ravel()[:5]]
             logger.info("Loaded calibrated camera intrinsics from %s", calib_path)
 
-        # 4. Initialize Fusion Engine
+        # 4. Initialize Phase 1 Fusion Engine
         self.fusion_engine = VPSFusionEngine(
             config=self.cfg,
             initial_height_m=self.cfg.camera.baseline_ground_offset_m,
@@ -101,12 +119,57 @@ class VPSApplication:
         # 6. Hardware Watchdog and Supervisor
         self.watchdog = WatchdogSupervisor()
 
+        # 7. Phase 2: Error-State EKF (15-State)
+        self.ekf = ErrorStateEKF(
+            initial_pos_ned=np.array([0.0, 0.0, -self.cfg.camera.baseline_ground_offset_m], dtype=np.float64),
+            initial_vel_ned=np.zeros(3, dtype=np.float64),
+            initial_yaw_rad=0.0,
+        )
+
+        # 8. Phase 2: VIO Velocity Estimator & Frame Tracker
+        self.vio_est = VIOVelocityEstimator(camera_config=self.cfg.camera)
+        self.vio_tracker = FeatureTracker(self.cfg.tracker)
+        R_b2c = np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]], dtype=np.float64)
+        self.vio_derot = GyroDerotationEngine(self.cfg.camera.K, R_body_to_cam=R_b2c)
+        self._prev_vio_gray: Optional[np.ndarray] = None
+        self._prev_vio_pts: Optional[np.ndarray] = None
+        self._prev_vio_att: Optional[np.ndarray] = None
+        self._prev_vio_time: Optional[float] = None
+
+        # 9. Phase 2: Offline Map DB & Absolute Map Matcher (Background Async Worker)
+        self.map_db: Optional[RuntimeMapDB] = None
+        self.orthorectifier: Optional[FrameOrthorectifier] = None
+        self.map_matcher: Optional[MapMatcher] = None
+        self._map_match_thread: Optional[threading.Thread] = None
+        self._map_match_running = False
+        self._map_match_lock = threading.Lock()
+        self._pending_map_job: Optional[Dict[str, Any]] = None
+        self._last_map_match_time: float = 0.0
+        self._last_map_match_status: str = "STANDBY"
+        self._reset_counter: int = 0
+
+        if getattr(self.cfg, "map", None) and self.cfg.map.enabled:
+            map_path = Path(self.cfg.map.db_path)
+            if (map_path / "manifest.json").is_file():
+                try:
+                    self.map_db = RuntimeMapDB(db_directory=map_path)
+                    self.orthorectifier = FrameOrthorectifier(camera_config=self.cfg.camera)
+                    self.map_matcher = MapMatcher(
+                        min_inliers_feature=self.cfg.map.min_inliers,
+                    )
+                    logger.info("Initialized Phase 2 Map Database from %s (GSD: %.2f m/px)", map_path, self.map_db.gsd_m_per_px)
+                except Exception as e:
+                    logger.warning("Could not load Map DB from %s: %s", map_path, e)
+            else:
+                logger.info("No Map DB found at %s. Operating in VIO-only dead-reckoning mode.", map_path)
+
     def start(self) -> bool:
-        """Start hardware devices and telemetry streams."""
-        logger.info("Starting Visual Positioning System...")
+        """Start hardware devices, telemetry streams, and background workers."""
+        logger.info("Starting Visual Positioning System (Phase 1 + Phase 2)...")
         logger.info("Camera: %s (%dx%d @ %d fps)", self.cfg.camera.name, self.cfg.camera.width, self.cfg.camera.height, self.cfg.camera.fps)
         logger.info("Baseline Landing-Gear Offset: %.3f m", self.cfg.camera.baseline_ground_offset_m)
         logger.info("MAVLink Endpoint: %s", self.cfg.mavlink.connection_string)
+        logger.info("Feed FC EKF: %s (Mode: %s)", self.cfg.mavlink.feed_fc_ekf, self.cfg.mavlink.odometry_mode)
 
         # Connect MAVLink
         if not self.mavlink_bridge.connect():
@@ -114,7 +177,8 @@ class VPSApplication:
         else:
             self.mavlink_bridge.start()
             self.mavlink_bridge.request_streams(rate_hz=self.cfg.mavlink.stream_rate_hz)
-            logger.info("MAVLink bridge connected and streaming DISTANCE_SENSOR at %.1f Hz", self.cfg.mavlink.distance_sensor_rate_hz)
+            logger.info("MAVLink bridge connected and streaming DISTANCE_SENSOR (%.1f Hz) & ODOMETRY (%.1f Hz)",
+                        self.cfg.mavlink.distance_sensor_rate_hz, self.cfg.mavlink.odometry_rate_hz)
 
         # Start Camera
         if not self.camera.start():
@@ -123,16 +187,103 @@ class VPSApplication:
 
         # Start Watchdog Supervisor
         self.watchdog.start()
+
+        # Start Map Matcher Background Thread
+        self._start_map_worker()
+
         self._running = True
         return True
 
+    def _start_map_worker(self) -> None:
+        """Start background worker thread for asynchronous map matching."""
+        if self.map_db is None or self.map_matcher is None or self.orthorectifier is None:
+            return
+        self._map_match_running = True
+        self._map_match_thread = threading.Thread(
+            target=self._map_match_worker_loop,
+            name="VPS_MapMatcherWorker",
+            daemon=True,
+        )
+        self._map_match_thread.start()
+        logger.info("Started background Map Matcher worker thread (target rate: %.1f Hz)", self.cfg.map.match_rate_hz)
+
+    def _map_match_worker_loop(self) -> None:
+        """Asynchronous worker loop executing orthorectification and tile matching."""
+        while self._map_match_running:
+            job = None
+            with self._map_match_lock:
+                if self._pending_map_job is not None:
+                    job = self._pending_map_job
+                    self._pending_map_job = None
+
+            if job is None:
+                time.sleep(0.01)
+                continue
+
+            frame = job["frame"]
+            timestamp_s = job["timestamp_s"]
+            rpy = job["attitude_rpy_rad"]
+            height_agl_m = job["height_agl_m"]
+            pos_prior_ned = job["pos_prior_ned"]
+
+            try:
+                # 1. Orthorectify live frame to nadir North-up image matching map GSD
+                target_gsd = self.map_db.gsd_m_per_px
+                ortho = self.orthorectifier.orthorectify(
+                    frame=frame,
+                    height_agl_m=height_agl_m,
+                    attitude_rpy_rad=rpy,
+                    target_gsd_m_per_px=target_gsd,
+                )
+                if not ortho.is_valid:
+                    self._last_map_match_status = f"ORTHO_INVALID: {ortho.status_message}"
+                    continue
+
+                # 2. Query spatial candidate tiles from runtime DB
+                candidate_tiles = self.map_db.query_tiles(
+                    pos_ned_m=pos_prior_ned[:2],
+                    search_radius_m=self.cfg.map.search_radius_m,
+                    max_tiles_return=4,
+                )
+                if not candidate_tiles:
+                    self._last_map_match_status = "NO_TILES_IN_SEARCH_WINDOW"
+                    continue
+
+                # 3. Match frame against reference tiles
+                match_res = self.map_matcher.match_frame_to_map(
+                    ortho=ortho,
+                    candidate_tiles=candidate_tiles,
+                    pos_prior_ned_m=pos_prior_ned[:2],
+                    search_radius_m=self.cfg.map.search_radius_m,
+                    timestamp_s=timestamp_s,
+                )
+
+                if match_res.is_valid and match_res.confidence >= self.cfg.map.min_confidence:
+                    # 4. Inject delayed-state correction into ES-EKF
+                    fused = self.ekf.update_map_match_delayed(
+                        fix_ned_m=match_res.pos_ned_m,
+                        cov_ned_m2=match_res.cov_ned_m2,
+                        timestamp_s=timestamp_s,
+                        confidence=match_res.confidence,
+                    )
+                    if fused:
+                        self._reset_counter += 1
+                    self._last_map_match_status = (
+                        f"MATCHED({match_res.match_method}, inliers={match_res.num_inliers}, "
+                        f"conf={match_res.confidence:.2f}, fused={fused})"
+                    )
+                else:
+                    self._last_map_match_status = f"MATCH_FAILED: {match_res.status_message or 'low confidence'}"
+            except Exception as e:
+                self._last_map_match_status = f"ERROR: {e}"
+
     def run_autonomous_flight(self) -> None:
-        """Main autonomous vision-in-the-loop processing loop."""
+        """Main autonomous vision-in-the-loop processing loop (Phase 1 + Phase 2)."""
         frame_idx = 0
         t_last_log = time.monotonic()
         fps_counter = 0
 
-        logger.info("Entering autonomous flight height estimation loop...")
+        logger.info("Entering autonomous flight navigation loop (Phase 1 Height + Phase 2 VIO & Map Matching)...")
         while self._running:
             ok, frame, t_capture = self.camera.read_frame()
             if not ok or frame is None:
@@ -143,21 +294,32 @@ class VPSApplication:
             frame_idx += 1
             fps_counter += 1
 
-            # Interpolate synchronized telemetry matching frame exposure time
+            # 1. Interpolate synchronized telemetry matching frame exposure midpoint
             telem = self.ring_buffer.interpolate(t_capture)
             if telem is not None:
                 self.watchdog.record_telemetry()
             else:
-                # Default kinematic state if telemetry hasn't arrived yet
                 telem = TelemetrySample(
                     timestamp_s=t_capture,
                     gyro_rad_s=np.zeros(3),
                     attitude_rpy_rad=np.zeros(3),
                     vel_ned_mps=np.zeros(3),
                     baro_alt_m=self.cfg.camera.baseline_ground_offset_m,
+                    pos_ned_m=np.zeros(3),
+                    accel_mps2=np.array([0.0, 0.0, -9.80665], dtype=np.float64),
                 )
 
-            # Process through fusion engine
+            # 2. ES-EKF High-Rate IMU Propagation
+            self.ekf.predict_imu(
+                accel_meas_mps2=telem.accel_mps2,
+                gyro_meas_rad_s=telem.gyro_rad_s,
+                timestamp_s=t_capture,
+            )
+
+            # 3. ES-EKF Compass Heading Update
+            self.ekf.update_compass_yaw(yaw_compass_rad=float(telem.attitude_rpy_rad[2]))
+
+            # 4. Phase 1: Height from De-Rotated Flow & Barometer Fusion
             fusion_out = self.fusion_engine.process_telemetry_and_frame(
                 frame=frame,
                 timestamp_s=t_capture,
@@ -169,7 +331,63 @@ class VPSApplication:
                 frame_idx=frame_idx,
             )
 
-            # Update outbound MAVLink rangefinder packet
+            h_agl = max(0.1, fusion_out.height_agl_m)
+
+            # 5. ES-EKF Vertical Position Update (Height AGL)
+            self.ekf.update_height(height_agl_m=h_agl)
+
+            # 6. Phase 2: Frame-to-Frame Metric VIO Velocity Estimation
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+
+            if h_agl > 0.3 and self._prev_vio_gray is not None and self._prev_vio_pts is not None and len(self._prev_vio_pts) >= 8:
+                dt_vio = t_capture - (self._prev_vio_time if self._prev_vio_time is not None else (t_capture - 1.0 / 30.0))
+                if dt_vio > 0.001:
+                    track_res = self.vio_tracker.track(self._prev_vio_gray, gray, self._prev_vio_pts)
+                    if track_res.num_inliers >= 8 and self._prev_vio_att is not None:
+                        delta_rpy = telem.attitude_rpy_rad - self._prev_vio_att
+                        R_rel = self.vio_derot.rotation_matrix_from_rpy_delta(delta_rpy[0], delta_rpy[1], delta_rpy[2])
+                        H_derot = self.vio_derot.compute_rotational_homography(R_rel)
+
+                        try:
+                            vio_res = self.vio_est.estimate_velocity_from_flow(
+                                pts0=track_res.pts_prev,
+                                pts1=track_res.pts_curr,
+                                inlier_mask=track_res.inlier_mask,
+                                H_derot=H_derot,
+                                height_agl_m=h_agl,
+                                dt_s=dt_vio,
+                                attitude_rpy_rad=telem.attitude_rpy_rad,
+                                timestamp_s=t_capture,
+                                compute_homography_alternative=False,
+                            )
+                            if vio_res.confidence > 0.2:
+                                self.ekf.update_vio_velocity(
+                                    vel_ned_mps=vio_res.vel_ned_mps,
+                                    confidence=vio_res.confidence,
+                                )
+                        except Exception as e:
+                            logger.debug("VIO estimation skipped: %s", e)
+
+            # Refresh tracking features for next frame
+            self._prev_vio_pts = self.vio_tracker.detect_features(gray)
+            self._prev_vio_gray = gray.copy()
+            self._prev_vio_att = telem.attitude_rpy_rad.copy()
+            self._prev_vio_time = t_capture
+
+            # 7. Asynchronous Map Matcher Job Queue (1-2 Hz)
+            if self.map_db is not None and (t_capture - self._last_map_match_time) >= (1.0 / self.cfg.map.match_rate_hz):
+                with self._map_match_lock:
+                    if self._pending_map_job is None:
+                        self._pending_map_job = {
+                            "frame": frame.copy(),
+                            "timestamp_s": t_capture,
+                            "attitude_rpy_rad": telem.attitude_rpy_rad.copy(),
+                            "height_agl_m": h_agl,
+                            "pos_prior_ned": self.ekf.state.pos_ned_m.copy(),
+                        }
+                        self._last_map_match_time = t_capture
+
+            # 8. MAVLink Output 1: DISTANCE_SENSOR (Phase 1)
             if self.mavlink_bridge.distance_sender:
                 self.mavlink_bridge.distance_sender.update_measurement(
                     height_agl_m=fusion_out.height_agl_m,
@@ -177,7 +395,18 @@ class VPSApplication:
                     covariance_m2=fusion_out.variance_m2,
                 )
 
-            # Periodic status logging (1 Hz)
+            # 9. MAVLink Output 2: ODOMETRY / VISION_POSITION_ESTIMATE (Phase 2)
+            if self.mavlink_bridge.odometry_sender:
+                self.mavlink_bridge.odometry_sender.update_from_ekf(
+                    nav_state=self.ekf.state,
+                    P_15x15=self.ekf.P,
+                    confidence=fusion_out.confidence,
+                    frame_timestamp_s=t_capture,
+                    gyro_rad_s=telem.gyro_rad_s,
+                    reset_counter=self._reset_counter,
+                )
+
+            # 10. Periodic Status Logging (1 Hz)
             t_now = time.monotonic()
             if t_now - t_last_log >= 1.0:
                 fps = fps_counter / (t_now - t_last_log)
@@ -185,13 +414,20 @@ class VPSApplication:
                 t_last_log = t_now
 
                 vis_str = f"{fusion_out.vision_height_m:5.2f}m" if fusion_out.vision_height_m is not None else "  --- "
+                pos_n = self.ekf.state.pos_ned_m[0]
+                pos_e = self.ekf.state.pos_ned_m[1]
+                vel_n = self.ekf.state.vel_ned_mps[0]
+                vel_e = self.ekf.state.vel_ned_mps[1]
+
                 logger.info(
-                    "AGL: %5.2fm | Baro: %5.2fm | Vision: %s | Conf: %.2f | Mode: %-18s | Rate: %4.1f fps",
+                    "AGL: %5.2fm | Pos: [%6.1f, %6.1f]m | Vel: [%5.1f, %5.1f]m/s | Map: %-22s | Conf: %.2f | Rate: %4.1f fps",
                     fusion_out.height_agl_m,
-                    telem.baro_alt_m,
-                    vis_str,
+                    pos_n,
+                    pos_e,
+                    vel_n,
+                    vel_e,
+                    self._last_map_match_status[:22],
                     fusion_out.confidence,
-                    fusion_out.mode_status,
                     fps,
                 )
 
@@ -267,6 +503,10 @@ class VPSApplication:
             return
         logger.info("Shutting down VPS...")
         self._running = False
+        self._map_match_running = False
+        if self._map_match_thread is not None:
+            self._map_match_thread.join(timeout=0.5)
+            self._map_match_thread = None
         self.watchdog.stop()
         self.camera.stop()
         self.mavlink_bridge.stop()
@@ -276,7 +516,7 @@ class VPSApplication:
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Visual Positioning System (VPS) Phase 1: Vision-Based Height Estimator",
+        description="Visual Positioning System (VPS) Phase 1 (Height) & Phase 2 (Horizontal Navigation)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", "-c", type=str, default="config/default_config.yaml", help="Path to YAML config file")
@@ -284,6 +524,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--camera", type=str, default=None, help="Camera device index, path, or 'mock'")
     parser.add_argument("--mode", choices=["flight", "handheld", "sitl"], default="flight", help="Operational mode")
     parser.add_argument("--baseline", type=float, default=None, help="Camera-to-landing-gear baseline ground offset in meters")
+    parser.add_argument("--map-db", type=str, default=None, help="Path to offline tiled GeoTIFF map database")
+    parser.add_argument("--no-map", action="store_true", help="Disable absolute map matching (run in VIO dead-reckoning mode)")
+    parser.add_argument("--feed-ekf", action="store_true", help="Enable active control feeding into ArduPilot FC EKF")
     return parser.parse_args()
 
 
@@ -302,6 +545,12 @@ def main() -> int:
         cfg.camera.device_index = args.camera
     if args.baseline is not None:
         cfg.camera.baseline_ground_offset_m = float(args.baseline)
+    if args.map_db is not None:
+        cfg.map.db_path = args.map_db
+    if args.no_map:
+        cfg.map.enabled = False
+    if args.feed_ekf:
+        cfg.mavlink.feed_fc_ekf = True
 
     if args.mode == "sitl":
         if args.connection is None:

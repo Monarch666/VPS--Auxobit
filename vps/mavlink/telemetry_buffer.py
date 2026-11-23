@@ -25,6 +25,8 @@ class TelemetrySample:
     baro_alt_m: float
     # 3D Position in Local NED (m) [X, Y, Z]
     pos_ned_m: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    # High-rate Acceleration in body frame (m/s^2) [ax, ay, az] (default 1g downward)
+    accel_mps2: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, -9.80665], dtype=np.float64))
 
 
 class TelemetryRingBuffer:
@@ -112,6 +114,7 @@ class TelemetryRingBuffer:
             gyro_interp = (1.0 - alpha) * s0.gyro_rad_s + alpha * s1.gyro_rad_s
             vel_interp = (1.0 - alpha) * s0.vel_ned_mps + alpha * s1.vel_ned_mps
             pos_interp = (1.0 - alpha) * s0.pos_ned_m + alpha * s1.pos_ned_m
+            accel_interp = (1.0 - alpha) * s0.accel_mps2 + alpha * s1.accel_mps2
             baro_interp = float((1.0 - alpha) * s0.baro_alt_m + alpha * s1.baro_alt_m)
 
             # Attitude interpolation: handle yaw wrap-around (-pi to +pi)
@@ -127,6 +130,7 @@ class TelemetryRingBuffer:
                 vel_ned_mps=vel_interp,
                 baro_alt_m=baro_interp,
                 pos_ned_m=pos_interp,
+                accel_mps2=accel_interp,
             )
 
     def get_gyro_samples_between(

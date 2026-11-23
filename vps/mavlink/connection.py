@@ -14,6 +14,7 @@ from pymavlink import mavutil
 from vps.config import MAVLinkConfig
 from .telemetry_buffer import TelemetryRingBuffer, TelemetrySample
 from .distance_sender import DistanceSensorSender
+from .odometry_sender import OdometrySender
 
 
 class MAVLinkBridge:
@@ -35,12 +36,14 @@ class MAVLinkBridge:
 
         self.mav: Optional[mavutil.mavlink_connection] = None
         self.distance_sender: Optional[DistanceSensorSender] = None
+        self.odometry_sender: Optional[OdometrySender] = None
 
         self._running = False
         self._recv_thread: Optional[threading.Thread] = None
 
         # Cached latest telemetry states
         self._latest_gyro = np.zeros(3, dtype=np.float64)
+        self._latest_accel = np.array([0.0, 0.0, -9.80665], dtype=np.float64)
         self._latest_att = np.zeros(3, dtype=np.float64)
         self._latest_vel = np.zeros(3, dtype=np.float64)
         self._latest_pos = np.zeros(3, dtype=np.float64)
@@ -59,6 +62,11 @@ class MAVLinkBridge:
                 config=self.cfg,
                 rate_hz=self.cfg.distance_sensor_rate_hz,
             )
+            self.odometry_sender = OdometrySender(
+                mav_connection=self.mav,
+                config=self.cfg,
+                rate_hz=self.cfg.odometry_rate_hz,
+            )
             return True
         except Exception as e:
             print(f"[ERROR] Failed to establish MAVLink connection: {e}")
@@ -71,7 +79,10 @@ class MAVLinkBridge:
         self._running = True
         self._recv_thread = threading.Thread(target=self._recv_worker, daemon=True)
         self._recv_thread.start()
-        self.distance_sender.start_streaming()
+        if self.distance_sender:
+            self.distance_sender.start_streaming()
+        if self.odometry_sender:
+            self.odometry_sender.start()
 
     def request_streams(self, rate_hz: Optional[int] = None) -> None:
         """Request high-rate data streams from ArduPilot."""
@@ -112,9 +123,11 @@ class MAVLinkBridge:
 
             if msg_type == "HIGHRES_IMU":
                 self._latest_gyro = np.array([msg.xgyro, msg.ygyro, msg.zgyro], dtype=np.float64)
+                self._latest_accel = np.array([msg.xacc, msg.yacc, msg.zacc], dtype=np.float64)
             elif msg_type == "RAW_IMU":
                 # Convert raw to rad/s if gyro scale factor applies
                 self._latest_gyro = np.array([msg.xgyro, msg.ygyro, msg.zgyro], dtype=np.float64) * 0.001
+                self._latest_accel = np.array([msg.xacc, msg.yacc, msg.zacc], dtype=np.float64) * 9.80665 / 1000.0
             elif msg_type == "ATTITUDE":
                 self._latest_att = np.array([msg.roll, msg.pitch, msg.yaw], dtype=np.float64)
             elif msg_type == "LOCAL_POSITION_NED":
@@ -131,6 +144,7 @@ class MAVLinkBridge:
                 vel_ned_mps=self._latest_vel.copy(),
                 baro_alt_m=self._latest_baro,
                 pos_ned_m=self._latest_pos.copy(),
+                accel_mps2=self._latest_accel.copy(),
             )
             self.buffer.add_sample(sample)
 
@@ -139,6 +153,8 @@ class MAVLinkBridge:
         self._running = False
         if self.distance_sender:
             self.distance_sender.stop_streaming()
+        if self.odometry_sender:
+            self.odometry_sender.stop()
         if self._recv_thread and self._recv_thread.is_alive():
             self._recv_thread.join(timeout=0.5)
         if self.mav is not None:

@@ -87,12 +87,23 @@ class LoggerConfig:
 
 
 @dataclass
+class MapConfig:
+    enabled: bool = True
+    db_path: str = "data/map_db/aurangabad_s2"
+    search_radius_m: float = 400.0
+    match_rate_hz: float = 1.0
+    min_inliers: int = 10
+    min_confidence: float = 0.25
+
+
+@dataclass
 class VPSConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     mavlink: MAVLinkConfig = field(default_factory=MAVLinkConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
+    map: MapConfig = field(default_factory=MapConfig)
 
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "VPSConfig":
@@ -118,6 +129,7 @@ class VPSConfig:
         mavlink_data = data.get("mavlink", {})
         fusion_data = data.get("fusion", {})
         logger_data = data.get("logger", {})
+        map_data = data.get("map", {})
 
         return cls(
             camera=CameraConfig(**camera_data),
@@ -125,6 +137,7 @@ class VPSConfig:
             mavlink=MAVLinkConfig(**mavlink_data),
             fusion=FusionConfig(**fusion_data),
             logger=LoggerConfig(**logger_data),
+            map=MapConfig(**map_data),
         )
 
     def to_yaml(self, yaml_path: str | Path) -> None:
@@ -140,6 +153,7 @@ class VPSConfig:
             "mavlink": self.mavlink.__dict__,
             "fusion": self.fusion.__dict__,
             "logger": self.logger.__dict__,
+            "map": self.map.__dict__,
         }
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)

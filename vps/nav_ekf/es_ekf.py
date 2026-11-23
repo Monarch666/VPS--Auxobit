@@ -36,11 +36,13 @@ class ESEKFConfig:
     sigma_vio_vel_mps: float = 0.35  # VIO velocity noise std (m/s)
     sigma_compass_yaw_rad: float = 0.035  # ~2.0 deg compass noise std
     sigma_height_m: float = 0.20  # Height / baro noise std (m)
+    sigma_map_match_pos_m: float = 8.0  # Absolute map match position std (m)
 
     # Innovation chi-square gating thresholds
     gate_vio_vel_chi2: float = 35.0  # 3-DOF chi^2 gating
     gate_compass_chi2: float = 15.0  # 1-DOF chi^2 gating
     gate_height_chi2: float = 15.0   # 1-DOF chi^2 gating
+    gate_map_match_chi2: float = 25.0 # 2-DOF chi^2 gating for horizontal position
 
     # Gravity constant in local NED
     gravity_mps2: float = 9.80665
@@ -131,6 +133,7 @@ class ErrorStateEKF:
 
         self._last_imu_timestamp_s: Optional[float] = None
         self._history_buffer: List[Tuple[float, NavState, np.ndarray]] = []
+        self._imu_buffer: List[Tuple[float, np.ndarray, np.ndarray]] = []
         self._max_history_len = 150  # 1.5 seconds @ 100 Hz
         self._consecutive_rejected_vio: int = 0
 
@@ -170,48 +173,33 @@ class ErrorStateEKF:
             axis[2] * np.sin(half_angle),
         ], dtype=np.float64)
 
-    def predict_imu(
+    def _propagate_kinematics_step(
         self,
+        state: NavState,
+        P: np.ndarray,
         accel_meas_mps2: np.ndarray,
         gyro_meas_rad_s: np.ndarray,
-        timestamp_s: float,
-    ) -> NavState:
-        """Propagate nominal kinematics and error covariance using IMU measurements.
-
-        Args:
-            accel_meas_mps2: Measured specific force in Body frame [ax, ay, az] (m/s^2).
-            gyro_meas_rad_s: Measured angular rate in Body frame [p, q, r] (rad/s).
-            timestamp_s: Monotonic measurement timestamp (seconds).
-
-        Returns:
-            Propagated NavState.
-        """
-        if self._last_imu_timestamp_s is not None:
-            dt = max(0.0005, min(0.05, timestamp_s - self._last_imu_timestamp_s))
-        else:
-            dt = 0.01  # default 100 Hz
-        self._last_imu_timestamp_s = timestamp_s
-        self.state.timestamp_s = timestamp_s
-
+        dt: float,
+    ) -> Tuple[NavState, np.ndarray]:
+        """Compute single strapdown integration step and covariance propagation."""
         # 1. Unbiased specific force and angular velocity in Body frame
-        f_b = accel_meas_mps2 - self.state.accel_bias_mps2
-        omega_b = gyro_meas_rad_s - self.state.gyro_bias_rad_s
-
-        R_wb = self.state.rotation_matrix
+        f_b = accel_meas_mps2 - state.accel_bias_mps2
+        omega_b = gyro_meas_rad_s - state.gyro_bias_rad_s
+        R_wb = state.rotation_matrix
 
         # 2. Specific force rotated to World NED + Gravity
         g_ned = np.array([0.0, 0.0, self.cfg.gravity_mps2], dtype=np.float64)
         a_w = R_wb @ f_b + g_ned
 
         # 3. Propagate nominal position and velocity (strapdown kinematics)
-        self.state.pos_ned_m += self.state.vel_ned_mps * dt + 0.5 * a_w * (dt ** 2)
-        self.state.vel_ned_mps += a_w * dt
+        pos_new = state.pos_ned_m + state.vel_ned_mps * dt + 0.5 * a_w * (dt ** 2)
+        vel_new = state.vel_ned_mps + a_w * dt
 
         # 4. Propagate nominal quaternion orientation
         delta_q = self.exp_rot_vector(omega_b * dt)
-        q_new = self.quat_mult(self.state.quat_wb, delta_q)
+        q_new = self.quat_mult(state.quat_wb, delta_q)
         q_norm = np.linalg.norm(q_new)
-        self.state.quat_wb = q_new / max(1e-12, q_norm)
+        quat_new = q_new / max(1e-12, q_norm)
 
         # 5. Continuous error-state Jacobian F_x (15x15)
         F_x = np.eye(15, dtype=np.float64)
@@ -237,11 +225,52 @@ class ErrorStateEKF:
         Q_d[12:15, 12:15] = np.eye(3) * (sbg2 * dt)
 
         # 7. Covariance propagation: P = F_x P F_x^T + Q_d
-        self.P = F_x @ self.P @ F_x.T + Q_d
-        # Ensure symmetry
-        self.P = 0.5 * (self.P + self.P.T)
+        P_new = F_x @ P @ F_x.T + Q_d
+        P_new = 0.5 * (P_new + P_new.T)
 
-        # 8. Record state history for delayed-state fusion
+        state_new = NavState(
+            timestamp_s=state.timestamp_s + dt,
+            pos_ned_m=pos_new,
+            vel_ned_mps=vel_new,
+            quat_wb=quat_new,
+            accel_bias_mps2=state.accel_bias_mps2.copy(),
+            gyro_bias_rad_s=state.gyro_bias_rad_s.copy(),
+        )
+        return state_new, P_new
+
+    def predict_imu(
+        self,
+        accel_meas_mps2: np.ndarray,
+        gyro_meas_rad_s: np.ndarray,
+        timestamp_s: float,
+    ) -> NavState:
+        """Propagate nominal kinematics and error covariance using IMU measurements.
+
+        Args:
+            accel_meas_mps2: Measured specific force in Body frame [ax, ay, az] (m/s^2).
+            gyro_meas_rad_s: Measured angular rate in Body frame [p, q, r] (rad/s).
+            timestamp_s: Monotonic measurement timestamp (seconds).
+
+        Returns:
+            Propagated NavState.
+        """
+        if self._last_imu_timestamp_s is not None:
+            dt = max(0.0005, min(0.05, timestamp_s - self._last_imu_timestamp_s))
+        else:
+            dt = 0.01  # default 100 Hz
+        self._last_imu_timestamp_s = timestamp_s
+
+        self.state, self.P = self._propagate_kinematics_step(
+            self.state, self.P, accel_meas_mps2, gyro_meas_rad_s, dt
+        )
+        self.state.timestamp_s = timestamp_s
+
+        # Buffer IMU measurements for delayed-state re-propagation
+        self._imu_buffer.append((timestamp_s, accel_meas_mps2.copy(), gyro_meas_rad_s.copy()))
+        if len(self._imu_buffer) > self._max_history_len:
+            self._imu_buffer.pop(0)
+
+        # Record state history for delayed-state fusion
         self._history_buffer.append((timestamp_s, self._clone_nav_state(self.state), self.P.copy()))
         if len(self._history_buffer) > self._max_history_len:
             self._history_buffer.pop(0)
@@ -407,18 +436,151 @@ class ErrorStateEKF:
         self._inject_and_reset(delta_x)
         return True
 
-    def _inject_and_reset(self, delta_x: np.ndarray) -> None:
-        """Inject error state into nominal state and reset error state to zero.
+    def update_map_match_delayed(
+        self,
+        fix_ned_m: np.ndarray,
+        cov_ned_m2: Optional[np.ndarray] = None,
+        timestamp_s: float = 0.0,
+        confidence: float = 1.0,
+        bypass_gate: bool = False,
+    ) -> bool:
+        """Fuse absolute georeferenced horizontal position fix (with latency compensation).
 
-        Nominal state updates:
-            p <- p + delta_p
-            v <- v + delta_v
-            q <- q (x) exp(0.5 * delta_theta)
-            b_a <- b_a + delta_ba
-            b_g <- b_g + delta_bg
-        Covariance reset:
-            P <- G P G^T
+        Uses delayed-state Kalman filtering:
+        1. Identifies the historical state snapshot corresponding to frame capture timestamp.
+        2. Evaluates the measurement innovation against the historical state.
+        3. Performs chi-squared innovation gating against measurement and filter covariance.
+        4. Injects error-state correction at the historical time point.
+        5. Re-propagates nominal state and error covariance forward to current time using buffered IMU data.
+
+        Args:
+            fix_ned_m: Absolute position fix in Local NED [North, East] (meters).
+            cov_ned_m2: Optional 2x2 horizontal position covariance matrix (m^2).
+            timestamp_s: Monotonic frame capture timestamp (seconds).
+            confidence: Inlier-based match confidence in [0.0, 1.0].
+            bypass_gate: If True, bypasses chi^2 innovation gating (for relocalization).
+
+        Returns:
+            True if fix was accepted and fused, False if gated out or rejected.
         """
+        if confidence < 0.15:
+            return False
+
+        # Determine measurement covariance matrix R_pos (2x2)
+        if cov_ned_m2 is not None:
+            R_pos = np.array(cov_ned_m2, dtype=np.float64)[:2, :2]
+        else:
+            eff_sigma = self.cfg.sigma_map_match_pos_m / max(0.2, confidence)
+            R_pos = np.eye(2, dtype=np.float64) * (eff_sigma ** 2)
+
+        # Measurement model: observes horizontal position [pos_N, pos_E] (indices 0, 1)
+        H = np.zeros((2, 15), dtype=np.float64)
+        H[0, 0] = 1.0
+        H[1, 1] = 1.0
+
+        target_pos_2d = np.array(fix_ned_m[:2], dtype=np.float64)
+
+        # Check if delayed-state fusion can find a matching historical snapshot
+        delayed_mode = False
+        hist_idx = -1
+        if timestamp_s > 0.0 and len(self._history_buffer) > 0:
+            time_diffs = [abs(entry[0] - timestamp_s) for entry in self._history_buffer]
+            min_diff = min(time_diffs)
+            if min_diff < 1.5:  # within 1.5 seconds historical window
+                hist_idx = int(np.argmin(time_diffs))
+                delayed_mode = True
+
+        if delayed_mode and hist_idx >= 0:
+            t_hist, state_hist, P_hist = self._history_buffer[hist_idx]
+            state_corr = self._clone_nav_state(state_hist)
+            P_corr = P_hist.copy()
+
+            # Innovation at historical snapshot
+            nu = target_pos_2d - state_corr.pos_ned_m[0:2]
+
+            # Innovation covariance
+            S = H @ P_corr @ H.T + R_pos
+            try:
+                S_inv = np.linalg.inv(S)
+                if not bypass_gate and self.cfg.gate_map_match_chi2 > 0:
+                    d2 = float(nu.T @ S_inv @ nu)
+                    if d2 > self.cfg.gate_map_match_chi2:
+                        return False
+            except np.linalg.LinAlgError:
+                return False
+
+            # Kalman gain at historical time
+            K = P_corr @ H.T @ S_inv  # shape (15, 2)
+            delta_x = K @ nu
+
+            # Joseph-form covariance update
+            I_KH = np.eye(15, dtype=np.float64) - K @ H
+            P_corr = I_KH @ P_corr @ I_KH.T + K @ R_pos @ K.T
+            P_corr = 0.5 * (P_corr + P_corr.T)
+
+            # Apply error correction to historical state
+            self._apply_correction(state_corr, P_corr, delta_x)
+
+            # Re-propagate forward from t_hist to current time using buffered IMU inputs
+            imu_samples_after = [s for s in self._imu_buffer if s[0] > t_hist]
+            last_t = t_hist
+            curr_state = state_corr
+            curr_P = P_corr
+
+            for t_imu, a_imu, g_imu in imu_samples_after:
+                dt_step = max(0.0005, min(0.05, t_imu - last_t))
+                last_t = t_imu
+                curr_state, curr_P = self._propagate_kinematics_step(
+                    curr_state, curr_P, a_imu, g_imu, dt_step
+                )
+                curr_state.timestamp_s = t_imu
+
+            self.state = curr_state
+            self.P = curr_P
+            return True
+
+        else:
+            # Direct instantaneous fusion (zero delay or buffer empty)
+            nu = target_pos_2d - self.state.pos_ned_m[0:2]
+            S = H @ self.P @ H.T + R_pos
+            try:
+                S_inv = np.linalg.inv(S)
+                if not bypass_gate and self.cfg.gate_map_match_chi2 > 0:
+                    d2 = float(nu.T @ S_inv @ nu)
+                    if d2 > self.cfg.gate_map_match_chi2:
+                        return False
+            except np.linalg.LinAlgError:
+                return False
+
+            K = self.P @ H.T @ S_inv
+            delta_x = K @ nu
+
+            I_KH = np.eye(15, dtype=np.float64) - K @ H
+            self.P = I_KH @ self.P @ I_KH.T + K @ R_pos @ K.T
+            self.P = 0.5 * (self.P + self.P.T)
+
+            self._inject_and_reset(delta_x)
+            return True
+
+    def update_map_match(
+        self,
+        fix_ned_m: np.ndarray,
+        cov_ned_m2: Optional[np.ndarray] = None,
+        timestamp_s: float = 0.0,
+        confidence: float = 1.0,
+        bypass_gate: bool = False,
+    ) -> bool:
+        """Alias for update_map_match_delayed."""
+        return self.update_map_match_delayed(
+            fix_ned_m=fix_ned_m,
+            cov_ned_m2=cov_ned_m2,
+            timestamp_s=timestamp_s,
+            confidence=confidence,
+            bypass_gate=bypass_gate,
+        )
+
+    def _apply_correction(self, state: NavState, P: np.ndarray, delta_x: np.ndarray) -> None:
+        """Apply error state vector into any NavState and reset its covariance."""
         dp = delta_x[0:3]
         dv = delta_x[3:6]
         dtheta = delta_x[6:9]
@@ -426,26 +588,28 @@ class ErrorStateEKF:
         dbg = delta_x[12:15]
 
         # 1. Position and Velocity corrections
-        self.state.pos_ned_m += dp
-        self.state.vel_ned_mps += dv
+        state.pos_ned_m += dp
+        state.vel_ned_mps += dv
 
         # 2. Attitude quaternion correction
         dq = self.exp_rot_vector(dtheta)
-        q_corrected = self.quat_mult(self.state.quat_wb, dq)
-        self.state.quat_wb = q_corrected / np.linalg.norm(q_corrected)
+        q_corrected = self.quat_mult(state.quat_wb, dq)
+        state.quat_wb = q_corrected / np.linalg.norm(q_corrected)
 
         # 3. Biases corrections
-        self.state.accel_bias_mps2 += dba
-        self.state.gyro_bias_rad_s += dbg
+        state.accel_bias_mps2 += dba
+        state.gyro_bias_rad_s += dbg
 
         # 4. Error state covariance reset Jacobian G (15x15)
-        # G is identity everywhere except for attitude error block:
-        # G[6:9, 6:9] = I - 0.5 * [dtheta]_x
         G = np.eye(15, dtype=np.float64)
         G[6:9, 6:9] = np.eye(3) - 0.5 * self.skew_symmetric(dtheta)
 
-        self.P = G @ self.P @ G.T
-        self.P = 0.5 * (self.P + self.P.T)
+        P[...] = G @ P @ G.T
+        P[...] = 0.5 * (P + P.T)
+
+    def _inject_and_reset(self, delta_x: np.ndarray) -> None:
+        """Inject error state into nominal state and reset error state to zero."""
+        self._apply_correction(self.state, self.P, delta_x)
 
     @staticmethod
     def _clone_nav_state(s: NavState) -> NavState:

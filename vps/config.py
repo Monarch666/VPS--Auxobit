@@ -60,7 +60,7 @@ class MAVLinkConfig:
     distance_sensor_rate_hz: int = 15
     sensor_orientation: str = "PITCH_270"
     min_distance_cm: int = 10
-    max_distance_cm: int = 30000
+    max_distance_cm: int = 40000
 
 
 @dataclass

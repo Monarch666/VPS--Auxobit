@@ -4,7 +4,7 @@
 # 1. Primary Rangefinder Configuration
 RNGFND1_TYPE        10      # 10 = MAVLink Rangefinder
 RNGFND1_MIN_CM      10      # 10 cm minimum detection threshold
-RNGFND1_MAX_CM      30000   # 30,000 cm (300 m) maximum detection threshold
+RNGFND1_MAX_CM      40000   # 40,000 cm (400 m) maximum detection threshold
 RNGFND1_ORIENT      25      # 25 = MAV_SENSOR_ROTATION_PITCH_270 (Pointing Downward)
 RNGFND1_GNDCLEAR    15      # 15 cm physical ground clearance from camera to landing gear contact plane
 RNGFND1_FILT        0.5     # Rangefinder noise filter factor

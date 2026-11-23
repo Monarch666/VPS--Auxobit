@@ -32,7 +32,7 @@ mavlink:
   distance_sensor_rate_hz: 15
   sensor_orientation: "PITCH_270"
   min_distance_cm: 10
-  max_distance_cm: 30000
+  max_distance_cm: 40000
 
 fusion:
   # Process noise

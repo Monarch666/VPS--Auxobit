@@ -9,6 +9,9 @@ data/*.png
 data/*.jpg
 data/calibration_samples/
 data/flight_logs/
+*.tiff
+*.tif
+reports/*.png
 
 
 

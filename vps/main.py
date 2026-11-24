@@ -50,6 +50,7 @@ from vps.map_matcher.orthorectifier import FrameOrthorectifier
 from vps.map_matcher.matcher import MapMatcher
 from vps.tools.aruco_validator import ArUcoValidator, ArUcoMarkerConfig
 from vps.tools.logger import TelemetryLogger, TelemetryRecord
+from vps.tools.session_recorder import ShadowSessionRecorder, ShadowTelemetryRecord
 from vps.health.watchdog import WatchdogSupervisor, ShadowSupervisor
 from vps.health.health_monitor import HealthMonitor
 
@@ -82,11 +83,18 @@ class VPSApplication:
         self.session_logger: Optional[TelemetryLogger] = None
 
         if self.record_session:
-            self.session_logger = TelemetryLogger(
+            self.session_logger = ShadowSessionRecorder(
                 output_dir=self.cfg.logger.output_dir,
                 save_images=self.save_images,
+                config_snapshot={
+                    "mode": self.cfg.mode,
+                    "camera": self.cfg.camera.__dict__,
+                    "fusion": self.cfg.fusion.__dict__,
+                    "mavlink": self.cfg.mavlink.__dict__,
+                    "map": self.cfg.map.__dict__ if hasattr(self.cfg, "map") else {},
+                },
             )
-            logger.info("Session telemetry logger active: %s", self.session_logger.session_dir)
+            logger.info("Session telemetry recorder active: %s", self.session_logger.session_dir)
 
         self._running = False
         self.ring_buffer = TelemetryRingBuffer(max_duration_s=10.0)

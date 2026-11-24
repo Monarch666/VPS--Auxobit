@@ -696,6 +696,48 @@ class TestE2EIntegration:
         assert np.all(np.isfinite(app.ekf.state.vel_ned_mps)), "NaN in EKF velocity"
         assert np.all(np.isfinite(app.ekf.P)), "NaN in EKF covariance"
 
+    def test_main_app_shadow_mode_recording(self, tmp_path):
+        """E2E: VPSApplication in Phase 1 Shadow Mode logs telemetry to CSV without feeding FC."""
+        from vps.main import VPSApplication
+        import threading
+
+        cfg = VPSConfig()
+        cfg.camera.device_index = "mock"
+        cfg.mavlink.connection_string = "udpin:127.0.0.1:19997"
+        cfg.mavlink.feed_fc_ekf = False
+        cfg.logger.output_dir = str(tmp_path / "shadow_logs")
+
+        app = VPSApplication(
+            config=cfg,
+            phase1_only=True,
+            record_session=True,
+        )
+        assert app.phase1_only is True
+        assert app.record_session is True
+        assert app.cfg.mavlink.feed_fc_ekf is False
+
+        started = app.start()
+        assert started, "VPSApplication failed to start in shadow mode"
+        # Map worker thread should NOT be started in phase 1 shadow mode
+        assert app._map_match_thread is None
+
+        # Run loop briefly
+        t = threading.Thread(target=app.run_autonomous_flight, daemon=True)
+        t.start()
+        time.sleep(0.3)
+
+        csv_path = app.session_logger.csv_path if app.session_logger else None
+        app.stop()
+        t.join(timeout=1.0)
+
+        assert csv_path is not None and csv_path.is_file(), f"Telemetry CSV not found at {csv_path}"
+        # Check CSV has headers and rows
+        with open(csv_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        assert len(lines) >= 2, f"CSV should contain at least header and 1 record, got {len(lines)}"
+        assert "estimated_h_m" in lines[0]
+        assert "baro_alt_m" in lines[0]
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

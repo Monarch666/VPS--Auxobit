@@ -132,3 +132,4 @@ def test_session_recorder_disarm_postroll(tmp_path):
     assert recorder.is_recording is False  # Stopped
 
     recorder.close()
+

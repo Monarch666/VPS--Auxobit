@@ -57,3 +57,4 @@ def test_flightcard_generation(tmp_path):
     assert "FLIGHT-01" in md
     assert "0.06m" in md
     assert "19.808798 N, 75.283380 E" in md
+

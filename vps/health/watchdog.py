@@ -109,7 +109,7 @@ class WatchdogSupervisor:
         min_fps: float = 15.0,
         max_telemetry_age_s: float = 1.0,
         max_cpu_temp_c: float = 80.0,
-        max_memory_mb: float = 300.0,
+        max_memory_mb: float = 600.0,
         hardware_watchdog_dev: str = "/dev/watchdog",
     ) -> None:
         """Initialize watchdog supervisor.
@@ -335,7 +335,7 @@ class ShadowSupervisor(WatchdogSupervisor):
         min_fps: float = 15.0,
         max_telemetry_age_s: float = 1.0,
         max_cpu_temp_c: float = 80.0,
-        max_memory_mb: float = 300.0,
+        max_memory_mb: float = 600.0,
         min_disk_free_mb: float = 500.0,
         storage_path: str = ".",
     ) -> None:

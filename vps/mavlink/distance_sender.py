@@ -11,7 +11,7 @@ import os
 os.environ["MAVLINK20"] = "1"
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 import inspect
 import threading
 import time

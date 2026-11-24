@@ -446,23 +446,56 @@ class VPSApplication:
 
             # Record session log if active
             if self.session_logger is not None:
-                rec = TelemetryRecord(
-                    timestamp_s=t_capture,
-                    frame_idx=frame_idx,
-                    roll_rad=float(telem.attitude_rpy_rad[0]),
-                    pitch_rad=float(telem.attitude_rpy_rad[1]),
-                    yaw_rad=float(telem.attitude_rpy_rad[2]),
-                    gyro_x_rad_s=float(telem.gyro_rad_s[0]),
-                    gyro_y_rad_s=float(telem.gyro_rad_s[1]),
-                    gyro_z_rad_s=float(telem.gyro_rad_s[2]),
-                    vel_n_mps=float(telem.vel_ned_mps[0]),
-                    vel_e_mps=float(telem.vel_ned_mps[1]),
-                    vel_d_mps=float(telem.vel_ned_mps[2]),
-                    baro_alt_m=float(telem.baro_alt_m),
-                    estimated_h_m=float(fusion_out.height_agl_m),
-                    confidence=float(fusion_out.confidence),
-                )
-                self.session_logger.log(rec, frame=frame if self.save_images else None)
+                if isinstance(self.session_logger, ShadowSessionRecorder):
+                    shadow_rec = ShadowTelemetryRecord(
+                        timestamp_s=t_capture,
+                        frame_idx=frame_idx,
+                        is_armed=True,
+                        roll_rad=float(telem.attitude_rpy_rad[0]),
+                        pitch_rad=float(telem.attitude_rpy_rad[1]),
+                        yaw_rad=float(telem.attitude_rpy_rad[2]),
+                        gyro_x_rad_s=float(telem.gyro_rad_s[0]),
+                        gyro_y_rad_s=float(telem.gyro_rad_s[1]),
+                        gyro_z_rad_s=float(telem.gyro_rad_s[2]),
+                        fc_vel_n_mps=float(telem.vel_ned_mps[0]),
+                        fc_vel_e_mps=float(telem.vel_ned_mps[1]),
+                        fc_vel_d_mps=float(telem.vel_ned_mps[2]),
+                        fc_pos_n_m=float(telem.pos_ned_m[0]),
+                        fc_pos_e_m=float(telem.pos_ned_m[1]),
+                        fc_pos_d_m=float(telem.pos_ned_m[2]),
+                        fc_baro_alt_m=float(telem.baro_alt_m),
+                        baro_alt_m=float(telem.baro_alt_m),
+                        vps_height_agl_m=float(fusion_out.height_agl_m),
+                        estimated_h_m=float(fusion_out.height_agl_m),
+                        vps_confidence=float(fusion_out.confidence),
+                        vps_status=fusion_out.mode_status,
+                    )
+                    if not self.phase1_only:
+                        shadow_rec.vps_pos_n_m = float(self.ekf.state.pos_ned_m[0])
+                        shadow_rec.vps_pos_e_m = float(self.ekf.state.pos_ned_m[1])
+                        shadow_rec.vps_pos_d_m = float(self.ekf.state.pos_ned_m[2])
+                        shadow_rec.vps_vel_n_mps = float(self.ekf.state.vel_ned_mps[0])
+                        shadow_rec.vps_vel_e_mps = float(self.ekf.state.vel_ned_mps[1])
+                        shadow_rec.vps_vel_d_mps = float(self.ekf.state.vel_ned_mps[2])
+                    self.session_logger.log_record_and_frame(shadow_rec, frame if self.save_images else None)
+                else:
+                    rec = TelemetryRecord(
+                        timestamp_s=t_capture,
+                        frame_idx=frame_idx,
+                        roll_rad=float(telem.attitude_rpy_rad[0]),
+                        pitch_rad=float(telem.attitude_rpy_rad[1]),
+                        yaw_rad=float(telem.attitude_rpy_rad[2]),
+                        gyro_x_rad_s=float(telem.gyro_rad_s[0]),
+                        gyro_y_rad_s=float(telem.gyro_rad_s[1]),
+                        gyro_z_rad_s=float(telem.gyro_rad_s[2]),
+                        vel_n_mps=float(telem.vel_ned_mps[0]),
+                        vel_e_mps=float(telem.vel_ned_mps[1]),
+                        vel_d_mps=float(telem.vel_ned_mps[2]),
+                        baro_alt_m=float(telem.baro_alt_m),
+                        estimated_h_m=float(fusion_out.height_agl_m),
+                        confidence=float(fusion_out.confidence),
+                    )
+                    self.session_logger.log(rec, frame=frame if self.save_images else None)
 
             # 8. MAVLink Output 1: DISTANCE_SENSOR (Phase 1)
             # Sends passive distance sensor packet for pilot display in Mission Planner HUD
@@ -472,6 +505,12 @@ class VPSApplication:
                     confidence=fusion_out.confidence,
                     covariance_m2=fusion_out.variance_m2,
                 )
+
+            # 9. Shadow Mode HUD: Broadcast VPS_H and VPS_CONF via NAMED_VALUE_FLOAT
+            # These are whitelisted through the safety chokepoint at <= 2 Hz
+            if self.cfg.mode == "shadow" and self.mavlink_bridge.chokepoint:
+                self.mavlink_bridge.send_named_value_float("VPS_H", float(fusion_out.height_agl_m))
+                self.mavlink_bridge.send_named_value_float("VPS_CONF", float(fusion_out.confidence))
 
             # 10. Periodic Status Logging (1 Hz)
             t_now = time.monotonic()
@@ -643,6 +682,7 @@ def main() -> int:
     record_session = bool(args.record or is_shadow)
 
     if is_shadow:
+        cfg.mode = "shadow"
         cfg.mavlink.feed_fc_ekf = False
 
     if args.mode == "sitl":

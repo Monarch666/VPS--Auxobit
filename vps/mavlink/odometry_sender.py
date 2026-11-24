@@ -19,7 +19,7 @@ import os
 os.environ["MAVLINK20"] = "1"
 
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from typing import Any, Optional, List, Tuple
 import threading
 import time
 import numpy as np

@@ -96,14 +96,31 @@ class MapConfig:
     min_confidence: float = 0.25
 
 
+class ConfigurationConflictError(ValueError):
+    """Raised when safety invariants are violated in configuration."""
+    pass
+
+
 @dataclass
 class VPSConfig:
+    mode: str = "flight"  # "flight", "shadow", "handheld", "sitl"
     camera: CameraConfig = field(default_factory=CameraConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     mavlink: MAVLinkConfig = field(default_factory=MAVLinkConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     map: MapConfig = field(default_factory=MapConfig)
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Enforce safety invariants and configuration consistency."""
+        if self.mode == "shadow" and self.mavlink.feed_fc_ekf:
+            raise ConfigurationConflictError(
+                "Safety Violation: Cannot enable 'feed_fc_ekf' when mode is 'shadow'. "
+                "Shadow mode must remain strictly observe-only."
+            )
 
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "VPSConfig":
@@ -122,6 +139,7 @@ class VPSConfig:
         with open(path, "r", encoding="utf-8") as f:
             data: Dict[str, Any] = yaml.safe_load(f) or {}
 
+        mode = data.get("mode", "flight")
         camera_data = data.get("camera", {})
         tracker_data = data.get("tracker", {})
         if "lk_win_size" in tracker_data and isinstance(tracker_data["lk_win_size"], list):
@@ -132,6 +150,7 @@ class VPSConfig:
         map_data = data.get("map", {})
 
         return cls(
+            mode=mode,
             camera=CameraConfig(**camera_data),
             tracker=TrackerConfig(**tracker_data),
             mavlink=MAVLinkConfig(**mavlink_data),
@@ -145,6 +164,7 @@ class VPSConfig:
         path = Path(yaml_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {
+            "mode": self.mode,
             "camera": self.camera.__dict__,
             "tracker": {
                 **self.tracker.__dict__,

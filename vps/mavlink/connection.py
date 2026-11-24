@@ -15,6 +15,7 @@ from vps.config import MAVLinkConfig
 from .telemetry_buffer import TelemetryRingBuffer, TelemetrySample
 from .distance_sender import DistanceSensorSender
 from .odometry_sender import OdometrySender
+from .safety_chokepoint import ShadowMAVLinkSafetyChokepoint
 
 
 class MAVLinkBridge:
@@ -24,17 +25,21 @@ class MAVLinkBridge:
         self,
         config: Optional[MAVLinkConfig] = None,
         ring_buffer: Optional[TelemetryRingBuffer] = None,
+        mode: str = "flight",
     ) -> None:
         """Initialize MAVLink bridge.
 
         Args:
             config: MAVLink connection and stream configuration.
             ring_buffer: Shared telemetry buffer. Created if not provided.
+            mode: Operating mode ("flight", "shadow", "handheld", "sitl").
         """
         self.cfg = config if config is not None else MAVLinkConfig()
         self.buffer = ring_buffer if ring_buffer is not None else TelemetryRingBuffer()
+        self.mode = str(mode).lower()
 
         self.mav: Optional[mavutil.mavlink_connection] = None
+        self.chokepoint: Optional[ShadowMAVLinkSafetyChokepoint] = None
         self.distance_sender: Optional[DistanceSensorSender] = None
         self.odometry_sender: Optional[OdometrySender] = None
 
@@ -50,22 +55,29 @@ class MAVLinkBridge:
         self._latest_baro = 0.0
 
     def connect(self) -> bool:
-        """Establish MAVLink connection."""
+        """Establish MAVLink connection and install safety chokepoint."""
         try:
             self.mav = mavutil.mavlink_connection(
                 self.cfg.connection_string,
                 baud=self.cfg.baudrate,
                 autoreconnect=True,
             )
+            # Install Safety Chokepoint before senders are initialized
+            self.chokepoint = ShadowMAVLinkSafetyChokepoint(
+                mav_connection=self.mav,
+                mode=self.mode,
+            )
             self.distance_sender = DistanceSensorSender(
                 mav_connection=self.mav,
                 config=self.cfg,
                 rate_hz=self.cfg.distance_sensor_rate_hz,
+                chokepoint=self.chokepoint,
             )
             self.odometry_sender = OdometrySender(
                 mav_connection=self.mav,
                 config=self.cfg,
                 rate_hz=self.cfg.odometry_rate_hz,
+                chokepoint=self.chokepoint,
             )
             return True
         except Exception as e:
@@ -85,9 +97,17 @@ class MAVLinkBridge:
             self.odometry_sender.start()
 
     def request_streams(self, rate_hz: Optional[int] = None) -> None:
-        """Request high-rate data streams from ArduPilot."""
+        """Request high-rate data streams from ArduPilot.
+
+        In shadow mode, sending COMMAND_LONG to the FC is strictly prohibited;
+        streams must be pre-configured on ArduPilot telemetry port.
+        """
         if self.mav is None:
             return
+        if self.chokepoint and self.chokepoint.is_shadow_mode:
+            # Under shadow mode invariants, sending COMMAND_LONG to FC is suppressed
+            return
+
         rate = rate_hz if rate_hz is not None else self.cfg.stream_rate_hz
         interval_us = int(1e6 / rate)
 
@@ -110,6 +130,24 @@ class MAVLinkBridge:
                 interval_us,
                 0, 0, 0, 0, 0
             )
+
+    def send_heartbeat(self) -> bool:
+        """Send HEARTBEAT packet via safety chokepoint."""
+        if self.chokepoint:
+            return self.chokepoint.send_heartbeat()
+        return False
+
+    def send_named_value_float(self, name: str, value: float) -> bool:
+        """Send diagnostic float to GCS and ArduPilot NVF DataFlash log via chokepoint."""
+        if self.chokepoint:
+            return self.chokepoint.send_named_value_float(name, value)
+        return False
+
+    def send_statustext(self, text: str, severity: int = mavutil.mavlink.MAV_SEVERITY_INFO) -> bool:
+        """Send diagnostic text string to GCS via chokepoint."""
+        if self.chokepoint:
+            return self.chokepoint.send_statustext(text, severity)
+        return False
 
     def _recv_worker(self) -> None:
         """Inbound MAVLink parser loop."""

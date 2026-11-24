@@ -19,13 +19,14 @@ Provides robust process lifecycle supervision:
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Callable
 import os
 import sys
 import time
 import socket
 import threading
 import subprocess
+import shutil
 
 
 @dataclass
@@ -311,4 +312,91 @@ class WatchdogSupervisor:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+
+
+class ShadowSupervisor(WatchdogSupervisor):
+    """Supervisor specialized for observe-only Shadow Mode on Raspberry Pi 5.
+
+    Key Responsibilities:
+    1. Zero FC Impact: Pi failure, thermal throttle, undervoltage, or process crash
+       must NEVER touch or influence the Flight Controller.
+    2. Graceful Resource Degradation:
+       - If CPU temperature >= 78 C or frame rate drops, degrade background processing
+         (e.g., reduce map matching rate or pause map matching) before dropping frame logging.
+       - If disk space is low (< 500 MB), trigger safe emergency log flush and cease logging.
+    3. Failure Confinement:
+       - If any component hangs or fails, the supervisor only stops logging; it never
+         sends reboot/failsafe commands to the FC.
+    """
+
+    def __init__(
+        self,
+        pet_interval_s: float = 2.0,
+        min_fps: float = 15.0,
+        max_telemetry_age_s: float = 1.0,
+        max_cpu_temp_c: float = 80.0,
+        max_memory_mb: float = 300.0,
+        min_disk_free_mb: float = 500.0,
+        storage_path: str = ".",
+    ) -> None:
+        super().__init__(
+            pet_interval_s=pet_interval_s,
+            min_fps=min_fps,
+            max_telemetry_age_s=max_telemetry_age_s,
+            max_cpu_temp_c=max_cpu_temp_c,
+            max_memory_mb=max_memory_mb,
+        )
+        self.min_disk_free_mb = float(min_disk_free_mb)
+        self.storage_path = str(storage_path)
+        self._degradation_callbacks: List[Callable[[str], None]] = []
+        self._is_degraded = False
+
+    def register_degradation_callback(self, cb: Callable[[str], None]) -> None:
+        """Register a callback for graceful degradation events (e.g. 'THROTTLE_MAP_MATCH')."""
+        self._degradation_callbacks.append(cb)
+
+    def read_disk_free_mb(self) -> float:
+        """Check free storage space on target logging drive."""
+        try:
+            usage = shutil.disk_usage(self.storage_path)
+            return float(usage.free) / (1024.0 * 1024.0)
+        except Exception:
+            return 9999.0
+
+    def evaluate_shadow_health(self) -> Dict[str, Any]:
+        """Evaluate full health status including disk and thermal headroom."""
+        metrics = self.evaluate_metrics()
+        disk_free = self.read_disk_free_mb()
+        disk_ok = disk_free >= self.min_disk_free_mb
+
+        # Check for thermal degradation (e.g. >= 78 deg C) or frame rate drop
+        should_degrade = (metrics.cpu_temp_c >= 78.0) or (metrics.fps < self.min_fps)
+
+        if should_degrade and not self._is_degraded:
+            self._is_degraded = True
+            for cb in self._degradation_callbacks:
+                try:
+                    cb("DEGRADE_RESOURCE_PRESSURE")
+                except Exception:
+                    pass
+        elif not should_degrade and self._is_degraded:
+            self._is_degraded = False
+            for cb in self._degradation_callbacks:
+                try:
+                    cb("RESTORE_NORMAL_OPERATION")
+                except Exception:
+                    pass
+
+        return {
+            "all_healthy": metrics.all_healthy and disk_ok,
+            "fps": metrics.fps,
+            "cpu_temp_c": metrics.cpu_temp_c,
+            "telemetry_age_s": metrics.telemetry_age_s,
+            "memory_rss_mb": metrics.memory_rss_mb,
+            "disk_free_mb": disk_free,
+            "disk_ok": disk_ok,
+            "is_degraded": self._is_degraded,
+            "throttled_flags": metrics.throttled_flags,
+            "status_summary": metrics.status_summary + f" | DiskFree: {disk_free:.0f}MB",
+        }
 

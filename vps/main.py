@@ -50,7 +50,7 @@ from vps.map_matcher.orthorectifier import FrameOrthorectifier
 from vps.map_matcher.matcher import MapMatcher
 from vps.tools.aruco_validator import ArUcoValidator, ArUcoMarkerConfig
 from vps.tools.logger import TelemetryLogger, TelemetryRecord
-from vps.health.watchdog import WatchdogSupervisor
+from vps.health.watchdog import WatchdogSupervisor, ShadowSupervisor
 from vps.health.health_monitor import HealthMonitor
 
 logging.basicConfig(
@@ -95,6 +95,7 @@ class VPSApplication:
         self.mavlink_bridge = MAVLinkBridge(
             config=self.cfg.mavlink,
             ring_buffer=self.ring_buffer,
+            mode=self.cfg.mode,
         )
 
         # 2. Initialize Camera Capture
@@ -137,7 +138,10 @@ class VPSApplication:
         )
 
         # 6. Hardware Watchdog and Supervisor
-        self.watchdog = WatchdogSupervisor()
+        if self.cfg.mode == "shadow":
+            self.watchdog = ShadowSupervisor(storage_path=self.cfg.logger.output_dir)
+        else:
+            self.watchdog = WatchdogSupervisor()
 
         # 7. Phase 2: Error-State EKF (15-State)
         self.ekf = ErrorStateEKF(

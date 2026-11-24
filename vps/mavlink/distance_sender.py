@@ -29,6 +29,7 @@ class DistanceSensorSender:
         mav_connection: mavutil.mavlink_connection,
         config: Optional[MAVLinkConfig] = None,
         rate_hz: float = 15.0,
+        chokepoint: Optional[Any] = None,
     ) -> None:
         """Initialize distance sensor sender.
 
@@ -36,11 +37,13 @@ class DistanceSensorSender:
             mav_connection: Active pymavlink connection.
             config: MAVLink configuration parameters.
             rate_hz: Transmission rate (Hz), must be >= 10 Hz.
+            chokepoint: Optional ShadowMAVLinkSafetyChokepoint instance.
         """
         self.mav = mav_connection
         self.cfg = config if config is not None else MAVLinkConfig()
         self.rate_hz = max(10.0, float(rate_hz))
         self.period_s = 1.0 / self.rate_hz
+        self.chokepoint = chokepoint
 
         self._lock = threading.Lock()
         self._current_distance_cm: int = 100
@@ -80,6 +83,9 @@ class DistanceSensorSender:
 
     def send_single_packet(self) -> bool:
         """Construct and send one DISTANCE_SENSOR packet immediately."""
+        if self.chokepoint and not self.chokepoint.is_message_allowed("DISTANCE_SENSOR"):
+            return False
+
         with self._lock:
             dist_cm = self._current_distance_cm
             qual = self._signal_quality

@@ -63,6 +63,7 @@ class OdometrySender:
         config: Optional[MAVLinkConfig] = None,
         health_monitor: Optional[HealthMonitor] = None,
         rate_hz: float = 25.0,
+        chokepoint: Optional[Any] = None,
     ) -> None:
         """Initialize odometry sender.
 
@@ -71,12 +72,14 @@ class OdometrySender:
             config: MAVLinkConfig instance.
             health_monitor: HealthMonitor instance enforcing safety interlocks.
             rate_hz: Streaming frequency in Hz (20 to 30 Hz).
+            chokepoint: Optional ShadowMAVLinkSafetyChokepoint instance.
         """
         self.mav = mav_connection
         self.cfg = config if config is not None else MAVLinkConfig()
         self.health_mon = health_monitor if health_monitor is not None else HealthMonitor(config=self.cfg)
         self.rate_hz = max(10.0, min(50.0, float(rate_hz)))
         self.period_s = 1.0 / self.rate_hz
+        self.chokepoint = chokepoint
 
         self._lock = threading.Lock()
         self._current_snapshot: Optional[OdometrySnapshot] = None
@@ -166,6 +169,9 @@ class OdometrySender:
         Returns:
             True if packet was dispatched over MAVLink, False otherwise.
         """
+        if self.chokepoint and not self.chokepoint.is_message_allowed("ODOMETRY"):
+            return False
+
         with self._lock:
             snap = self._current_snapshot
 

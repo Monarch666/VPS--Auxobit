@@ -440,16 +440,23 @@ class VPSApplication:
             # Record session log if active
             if self.session_logger is not None:
                 if isinstance(self.session_logger, ShadowSessionRecorder):
+                    fc_status = self.mavlink_bridge.get_fc_status()
                     shadow_rec = ShadowTelemetryRecord(
                         timestamp_s=t_capture,
+                        fc_boot_ms=int(fc_status["fc_boot_ms"]),
                         frame_idx=frame_idx,
-                        is_armed=True,
+                        is_armed=bool(fc_status["is_armed"]),
+                        flight_mode=str(fc_status["flight_mode"]),
+                        battery_voltage_v=float(fc_status["battery_voltage_v"]),
                         roll_rad=float(telem.attitude_rpy_rad[0]),
                         pitch_rad=float(telem.attitude_rpy_rad[1]),
                         yaw_rad=float(telem.attitude_rpy_rad[2]),
                         gyro_x_rad_s=float(telem.gyro_rad_s[0]),
                         gyro_y_rad_s=float(telem.gyro_rad_s[1]),
                         gyro_z_rad_s=float(telem.gyro_rad_s[2]),
+                        accel_x_mps2=float(telem.accel_mps2[0]),
+                        accel_y_mps2=float(telem.accel_mps2[1]),
+                        accel_z_mps2=float(telem.accel_mps2[2]),
                         fc_vel_n_mps=float(telem.vel_ned_mps[0]),
                         fc_vel_e_mps=float(telem.vel_ned_mps[1]),
                         fc_vel_d_mps=float(telem.vel_ned_mps[2]),
@@ -458,8 +465,18 @@ class VPSApplication:
                         fc_pos_d_m=float(telem.pos_ned_m[2]),
                         fc_baro_alt_m=float(telem.baro_alt_m),
                         baro_alt_m=float(telem.baro_alt_m),
+                        gps_fix_type=int(fc_status["gps_fix_type"]),
+                        gps_lat_deg=float(fc_status["gps_lat_deg"]),
+                        gps_lon_deg=float(fc_status["gps_lon_deg"]),
+                        gps_alt_m=float(fc_status["gps_alt_m"]),
+                        gps_eph_m=float(fc_status["gps_eph_m"]),
+                        gps_epv_m=float(fc_status["gps_epv_m"]),
+                        gps_satellites=int(fc_status["gps_satellites"]),
+                        rangefinder_dist_m=float(fc_status["rangefinder_dist_m"]),
                         vps_height_agl_m=float(fusion_out.height_agl_m),
                         estimated_h_m=float(fusion_out.height_agl_m),
+                        vps_height_std_m=float(np.sqrt(max(0.0, fusion_out.variance_m2))),
+                        vps_terrain_alt_m=float(fusion_out.terrain_elevation_m),
                         vps_confidence=float(fusion_out.confidence),
                         vps_status=fusion_out.mode_status,
                     )
@@ -470,7 +487,11 @@ class VPSApplication:
                         shadow_rec.vps_vel_n_mps = float(self.ekf.state.vel_ned_mps[0])
                         shadow_rec.vps_vel_e_mps = float(self.ekf.state.vel_ned_mps[1])
                         shadow_rec.vps_vel_d_mps = float(self.ekf.state.vel_ned_mps[2])
-                    self.session_logger.log_record_and_frame(shadow_rec, frame if self.save_images else None)
+                    self.session_logger.log_record_and_frame(
+                        shadow_rec,
+                        frame if self.save_images else None,
+                        force_recording=(not fc_status["heartbeat_seen"]),
+                    )
                 else:
                     rec = TelemetryRecord(
                         timestamp_s=t_capture,
@@ -499,9 +520,10 @@ class VPSApplication:
                     covariance_m2=fusion_out.variance_m2,
                 )
 
-            # 9. Shadow Mode HUD: Broadcast VPS_H and VPS_CONF via NAMED_VALUE_FLOAT
-            # These are whitelisted through the safety chokepoint at <= 2 Hz
+            # 9. Shadow Mode HUD: Broadcast VPS_H, VPS_CONF, and companion HEARTBEAT
+            # Whitelisted through the safety chokepoint (HEARTBEAT <= 1 Hz, NVF <= 2 Hz)
             if self.cfg.mode == "shadow" and self.mavlink_bridge.chokepoint:
+                self.mavlink_bridge.send_heartbeat()
                 self.mavlink_bridge.send_named_value_float("VPS_H", float(fusion_out.height_agl_m))
                 self.mavlink_bridge.send_named_value_float("VPS_CONF", float(fusion_out.confidence))
 

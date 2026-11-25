@@ -301,3 +301,11 @@ def test_shadow_supervisor_health_and_degradation():
     health_normal = supervisor.evaluate_shadow_health()
     assert health_normal["is_degraded"] is False
     assert "RESTORE_NORMAL_OPERATION" in degrade_events
+
+
+def test_mavlink_bridge_parse_serial_connection_string():
+    """Verify serial device:baud shorthand parses cleanly without breaking UDP URIs."""
+    assert MAVLinkBridge.parse_connection_string("/dev/ttyAMA0:921600", 57600) == ("/dev/ttyAMA0", 921600)
+    assert MAVLinkBridge.parse_connection_string("/dev/ttyAMA0", 921600) == ("/dev/ttyAMA0", 921600)
+    assert MAVLinkBridge.parse_connection_string("COM4:115200", 57600) == ("COM4", 115200)
+    assert MAVLinkBridge.parse_connection_string("udpin:127.0.0.1:14550", 921600) == ("udpin:127.0.0.1:14550", 921600)

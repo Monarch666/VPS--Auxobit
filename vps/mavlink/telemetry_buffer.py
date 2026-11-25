@@ -95,10 +95,10 @@ class TelemetryRingBuffer:
                 # Query is newer than newest sample: clamp to newest
                 return self._samples[-1]
 
-            # Find bounding bracket [t0, t1]
-            s0 = self._samples[0]
-            s1 = self._samples[1]
-            for i in range(len(self._samples) - 1):
+            # Find bounding bracket [t0, t1] (search backwards since queries are near tail)
+            s0 = self._samples[-2]
+            s1 = self._samples[-1]
+            for i in range(len(self._samples) - 2, -1, -1):
                 if self._samples[i].timestamp_s <= query_t <= self._samples[i + 1].timestamp_s:
                     s0 = self._samples[i]
                     s1 = self._samples[i + 1]

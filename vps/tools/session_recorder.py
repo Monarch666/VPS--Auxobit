@@ -127,7 +127,7 @@ class ShadowTelemetryRecord:
 class PreRollItem:
     """Cached in-memory pre-roll item."""
     record: ShadowTelemetryRecord
-    frame: Optional[np.ndarray] = None
+    frame: Optional[np.ndarray | bytes] = None
 
 
 class AsynchronousFrameWriter:
@@ -136,7 +136,7 @@ class AsynchronousFrameWriter:
     def __init__(
         self,
         images_dir: Path,
-        max_queue_size: int = 200,
+        max_queue_size: int = 600,
         jpeg_quality: int = 85,
     ) -> None:
         self.images_dir = images_dir
@@ -165,9 +165,9 @@ class AsynchronousFrameWriter:
         self,
         frame_idx: int,
         timestamp_s: float,
-        frame: np.ndarray,
+        frame: np.ndarray | bytes,
     ) -> Optional[str]:
-        """Submit a frame for background encoding and disk write.
+        """Submit a frame (raw ndarray or pre-encoded JPEG bytes) for disk write.
 
         Returns:
             Relative image path if accepted into queue, None if dropped.
@@ -197,7 +197,11 @@ class AsynchronousFrameWriter:
             img_name, frame = item
             full_path = self.images_dir / img_name
             try:
-                cv2.imwrite(str(full_path), frame, encode_params)
+                if isinstance(frame, (bytes, bytearray)):
+                    with open(full_path, "wb") as f_out:
+                        f_out.write(frame)
+                else:
+                    cv2.imwrite(str(full_path), frame, encode_params)
                 with self._lock:
                     self._written_frames += 1
             except Exception as e:
@@ -417,9 +421,13 @@ class ShadowSessionRecorder:
         if self._is_recording:
             self._write_single_record(record, frame)
         else:
-            # Buffer in memory for pre-roll
+            # Store JPEG-compressed bytes in pre-roll RAM buffer (~20x less memory on 1 GB Pi)
+            cached_frame: Optional[np.ndarray | bytes] = None
+            if frame is not None and self.save_images:
+                ok_enc, enc_buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                cached_frame = enc_buf.tobytes() if ok_enc else frame.copy()
             with self._buffer_lock:
-                self._pre_roll_buffer.append(PreRollItem(record=record, frame=frame.copy() if frame is not None else None))
+                self._pre_roll_buffer.append(PreRollItem(record=record, frame=cached_frame))
 
     def _start_recording_and_flush_preroll(self) -> None:
         """Triggered when drone arms: flush in-memory pre-roll buffer to disk."""
@@ -437,7 +445,7 @@ class ShadowSessionRecorder:
     def _write_single_record(
         self,
         record: ShadowTelemetryRecord,
-        frame: Optional[np.ndarray],
+        frame: Optional[np.ndarray | bytes],
     ) -> None:
         """Commit record and frame to disk."""
         self._frame_counter += 1

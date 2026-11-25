@@ -77,6 +77,12 @@ class VPSApplication:
         if connection_override:
             self.cfg.mavlink.connection_string = connection_override
 
+        # Prevent OpenCV thread pools from starving libcamera / MAVLink on 4-core Pi
+        try:
+            cv2.setNumThreads(2)
+        except Exception:
+            pass
+
         self.phase1_only = phase1_only
         self.record_session = record_session
         self.save_images = save_images

@@ -54,6 +54,7 @@ class MAVLinkBridge:
         self._latest_vel = np.zeros(3, dtype=np.float64)
         self._latest_pos = np.zeros(3, dtype=np.float64)
         self._latest_baro = 0.0
+        self._baro_ground_offset: Optional[float] = None
         self._has_local_pos_ned = False
         self._home_lat_deg: Optional[float] = None
         self._home_lon_deg: Optional[float] = None
@@ -265,8 +266,14 @@ class MAVLinkBridge:
                         pn, pe = 0.0, 0.0
                     self._latest_pos = np.array([pn, pe, -rel_alt_m], dtype=np.float64)
                     self._latest_vel = np.array([msg.vx * 0.01, msg.vy * 0.01, msg.vz * 0.01], dtype=np.float64)
+                    self._latest_baro = rel_alt_m
             elif msg_type == "VFR_HUD":
-                self._latest_baro = float(msg.alt)
+                alt = float(msg.alt)
+                if self._baro_ground_offset is None:
+                    self._baro_ground_offset = alt
+                # If relative altitude from GLOBAL_POSITION_INT is not active, use tared baro
+                if self._home_lat_deg is None and not self._has_local_pos_ned:
+                    self._latest_baro = alt - self._baro_ground_offset
             else:
                 continue
 

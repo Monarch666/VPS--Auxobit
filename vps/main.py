@@ -485,6 +485,10 @@ class VPSApplication:
                         vps_terrain_alt_m=float(fusion_out.terrain_elevation_m),
                         vps_confidence=float(fusion_out.confidence),
                         vps_status=fusion_out.mode_status,
+                        features_detected=int(fusion_out.num_inliers),
+                        features_tracked=int(fusion_out.num_inliers),
+                        inlier_count=int(fusion_out.num_inliers),
+                        optical_flow_mean_px=float(fusion_out.median_flow_px),
                     )
                     if not self.phase1_only:
                         shadow_rec.vps_pos_n_m = float(self.ekf.state.pos_ned_m[0])

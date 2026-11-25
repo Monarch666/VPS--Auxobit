@@ -250,8 +250,9 @@ class Picamera2CameraCapture(CameraCaptureBase):
             video_cfg = self._picam2.create_video_configuration(
                 main={
                     "size": (int(self.cfg.width), int(self.cfg.height)),
-                    "format": "BGR888",
+                    "format": "YUV420",
                 },
+                buffer_count=6,
                 controls={"FrameRate": float(self.cfg.fps)},
             )
             self._picam2.configure(video_cfg)
@@ -268,13 +269,21 @@ class Picamera2CameraCapture(CameraCaptureBase):
             self.release()
             return False
 
+    def _extract_gray(self, raw: np.ndarray) -> np.ndarray:
+        """Extract exact (H, W) luminance grayscale plane from YUV420 buffer."""
+        h, w = int(self.cfg.height), int(self.cfg.width)
+        if raw.ndim == 2 and raw.shape[0] >= h and raw.shape[1] >= w:
+            return raw[:h, :w].copy()
+        return raw
+
     def _worker(self) -> None:
         """Background capture loop grabbing frames with monotonic timestamps."""
         while self._running and self._picam2 is not None:
             try:
-                frame = self._picam2.capture_array()
+                raw = self._picam2.capture_array()
                 t_now = time.monotonic()
-                if frame is not None:
+                if raw is not None:
+                    frame = self._extract_gray(raw)
                     with self._lock:
                         self._latest_frame = frame
                         self._latest_timestamp = max(t_now, self._latest_timestamp + 1e-6)
@@ -295,10 +304,10 @@ class Picamera2CameraCapture(CameraCaptureBase):
                 return False, None, 0.0
         else:
             try:
-                frame = self._picam2.capture_array()
+                raw = self._picam2.capture_array()
                 t_now = time.monotonic()
-                if frame is not None:
-                    return True, frame, t_now
+                if raw is not None:
+                    return True, self._extract_gray(raw), t_now
             except Exception:
                 pass
             return False, None, 0.0
@@ -344,6 +353,21 @@ class AutoCameraCapture(CameraCaptureBase):
             self._backend = Picamera2CameraCapture(config=self.cfg)
             return self._backend.open()
 
+        # On Raspberry Pi with libcamera/CSI (e.g., IMX296), raw V4L2 (/dev/video0)
+        # opens in OpenCV without failing open() but yields zero frames on read().
+        # Prefer Picamera2 automatically when a libcamera sensor is present for device 0.
+        if dev_str in ("0", "/dev/video0") and Picamera2CameraCapture.is_available():
+            try:
+                from picamera2 import Picamera2
+                if len(Picamera2.global_camera_info()) > 0:
+                    logger.info("Detected Raspberry Pi CSI camera via libcamera; using Picamera2 backend for %s", self.device_index)
+                    pi_cam = Picamera2CameraCapture(config=self.cfg)
+                    if pi_cam.open():
+                        self._backend = pi_cam
+                        return True
+            except Exception as e:
+                logger.debug("Picamera2 probe skipped: %s", e)
+
         try:
             dev_arg: int | str = int(self.device_index)
         except (ValueError, TypeError):
@@ -353,14 +377,6 @@ class AutoCameraCapture(CameraCaptureBase):
         if cv_cam.open():
             self._backend = cv_cam
             return True
-
-        # Raw V4L2 unicam nodes (/dev/video0) on Raspberry Pi Bookworm/Trixie require Picamera2
-        if Picamera2CameraCapture.is_available():
-            logger.info("OpenCV could not open %s; falling back to Picamera2 CSI backend", self.device_index)
-            pi_cam = Picamera2CameraCapture(config=self.cfg)
-            if pi_cam.open():
-                self._backend = pi_cam
-                return True
 
         return False
 

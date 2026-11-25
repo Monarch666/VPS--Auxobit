@@ -54,6 +54,9 @@ class MAVLinkBridge:
         self._latest_vel = np.zeros(3, dtype=np.float64)
         self._latest_pos = np.zeros(3, dtype=np.float64)
         self._latest_baro = 0.0
+        self._has_local_pos_ned = False
+        self._home_lat_deg: Optional[float] = None
+        self._home_lon_deg: Optional[float] = None
         self._fc_status: Dict[str, Any] = {
             "heartbeat_seen": False,
             "is_armed": False,
@@ -242,8 +245,26 @@ class MAVLinkBridge:
                 with self._state_lock:
                     self._fc_status["fc_boot_ms"] = int(getattr(msg, "time_boot_ms", 0))
             elif msg_type == "LOCAL_POSITION_NED":
+                self._has_local_pos_ned = True
                 self._latest_pos = np.array([msg.x, msg.y, msg.z], dtype=np.float64)
                 self._latest_vel = np.array([msg.vx, msg.vy, msg.vz], dtype=np.float64)
+            elif msg_type == "GLOBAL_POSITION_INT":
+                # ArduPilot MAV1_POSITION streams GLOBAL_POSITION_INT (1e-7 deg, mm, cm/s)
+                if not self._has_local_pos_ned:
+                    lat_deg = float(msg.lat) * 1e-7
+                    lon_deg = float(msg.lon) * 1e-7
+                    rel_alt_m = float(msg.relative_alt) * 0.001
+                    if self._home_lat_deg is None and (abs(lat_deg) > 1e-5 or abs(lon_deg) > 1e-5):
+                        self._home_lat_deg = lat_deg
+                        self._home_lon_deg = lon_deg
+                    if self._home_lat_deg is not None and self._home_lon_deg is not None:
+                        r_earth = 6378137.0
+                        pn = np.radians(lat_deg - self._home_lat_deg) * r_earth
+                        pe = np.radians(lon_deg - self._home_lon_deg) * r_earth * np.cos(np.radians(self._home_lat_deg))
+                    else:
+                        pn, pe = 0.0, 0.0
+                    self._latest_pos = np.array([pn, pe, -rel_alt_m], dtype=np.float64)
+                    self._latest_vel = np.array([msg.vx * 0.01, msg.vy * 0.01, msg.vz * 0.01], dtype=np.float64)
             elif msg_type == "VFR_HUD":
                 self._latest_baro = float(msg.alt)
             else:

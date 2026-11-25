@@ -36,7 +36,7 @@ import cv2
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vps.config import VPSConfig, load_config
-from vps.camera.capture import OpenCVCameraCapture, MockCameraCapture
+from vps.camera.capture import create_camera_capture
 from vps.camera.calibration import load_calibration_yaml
 from vps.mavlink.telemetry_buffer import TelemetryRingBuffer, TelemetrySample
 from vps.mavlink.connection import MAVLinkBridge
@@ -106,18 +106,11 @@ class VPSApplication:
             mode=self.cfg.mode,
         )
 
-        # 2. Initialize Camera Capture
-        if str(self.cfg.camera.device_index).lower() == "mock":
-            self.camera = MockCameraCapture(fps=self.cfg.camera.fps)
-        else:
-            try:
-                dev_idx = int(self.cfg.camera.device_index)
-            except ValueError:
-                dev_idx = self.cfg.camera.device_index
-            self.camera = OpenCVCameraCapture(
-                device_index=dev_idx,
-                config=self.cfg.camera,
-            )
+        # 2. Initialize Camera Capture (auto-selects Mock / OpenCV / Picamera2 CSI)
+        self.camera = create_camera_capture(
+            device_index=self.cfg.camera.device_index,
+            config=self.cfg.camera,
+        )
 
         # 3. Load Calibrated Intrinsics
         calib_path = Path("config/imx296_calibrated.yaml")

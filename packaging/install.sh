@@ -78,7 +78,7 @@ usermod -aG dialout,video,gpio,i2c "${TARGET_USER}"
 
 echo -e "${GREEN}[4/6] Setting up Python virtual environment at ${VPS_DIR}/venv...${NC}"
 if [ ! -d "${VPS_DIR}/venv" ]; then
-    sudo -u "${TARGET_USER}" python3 -m venv "${VPS_DIR}/venv"
+    sudo -u "${TARGET_USER}" python3 -m venv --system-site-packages "${VPS_DIR}/venv"
 fi
 
 sudo -u "${TARGET_USER}" "${VPS_DIR}/venv/bin/pip" install --upgrade pip
@@ -90,7 +90,8 @@ sudo -u "${TARGET_USER}" "${VPS_DIR}/venv/bin/pip" install \
     scipy \
     psutil \
     pytest \
-    tifffile
+    tifffile \
+    matplotlib
 
 echo -e "${GREEN}[5/6] Deploying systemd production service...${NC}"
 cp "${VPS_DIR}/packaging/vps.service" /etc/systemd/system/vps.service

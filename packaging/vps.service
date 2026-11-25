@@ -9,7 +9,7 @@ Type=notify
 User=pi
 Group=dialout
 WorkingDirectory=/home/pi/VPS
-ExecStart=/home/pi/VPS/venv/bin/python -m vps.main --config /home/pi/VPS/config/default_config.yaml --connection /dev/ttyAMA0:921600 --camera /dev/video0 --mode flight
+ExecStart=/home/pi/VPS/venv/bin/python -m vps.main --config /home/pi/VPS/config/default_config.yaml --connection /dev/ttyAMA0:921600 --camera /dev/video0 --shadow --record --save-images
 
 # Process Supervision and Automated Recovery
 Restart=on-failure
@@ -30,7 +30,7 @@ LimitMEMLOCK=infinity
 # Security & Sandbox Hardening
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/home/pi/VPS/data/logs /home/pi/VPS/data/map_db
+ReadWritePaths=/home/pi/VPS/logs /home/pi/VPS/data/logs /home/pi/VPS/data/map_db
 DeviceAllow=/dev/video0 rw
 DeviceAllow=/dev/ttyAMA0 rw
 DeviceAllow=/dev/watchdog rw

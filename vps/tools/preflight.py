@@ -31,7 +31,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from vps.config import VPSConfig, load_config
-from vps.camera.capture import MockCameraCapture, OpenCVCameraCapture
+from vps.camera.capture import create_camera_capture
 from vps.camera.calibration import load_calibration_yaml
 from vps.map_db.runtime_lookup import RuntimeMapDB
 
@@ -142,14 +142,7 @@ class PreflightChecker:
 
     def _check_camera_hardware_and_focus(self) -> None:
         """Capture test frames, test focus sharpness (Laplacian variance), and timestamp jitter."""
-        if str(self.cfg.camera.device_index).lower() == "mock":
-            cam = MockCameraCapture(fps=self.cfg.camera.fps)
-        else:
-            try:
-                dev = int(self.cfg.camera.device_index)
-            except ValueError:
-                dev = self.cfg.camera.device_index
-            cam = OpenCVCameraCapture(device_index=dev, config=self.cfg.camera)
+        cam = create_camera_capture(device_index=self.cfg.camera.device_index, config=self.cfg.camera)
 
         if not cam.start():
             self.results.append(CheckResult(
@@ -163,12 +156,14 @@ class PreflightChecker:
 
         frames = []
         timestamps = []
-        for _ in range(5):
+        deadline = time.monotonic() + 1.5
+        while len(frames) < 5 and time.monotonic() < deadline:
             ret, frame, t_cap = cam.read_frame()
             if ret and frame is not None:
                 frames.append(frame)
                 timestamps.append(t_cap)
-            time.sleep(0.01)
+            else:
+                time.sleep(0.01)
         cam.stop()
 
         if len(frames) < 3:

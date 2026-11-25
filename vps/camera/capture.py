@@ -2,20 +2,23 @@
 
 Supports:
 - OpenCV VideoCapture (V4L2 / USB / CSI on Linux/Windows)
+- Picamera2 adapter for Raspberry Pi 4 / Pi 5 (libcamera / Sony IMX296)
 - Mock camera capture (replaying image directory or synthetic simulator)
-- PiCamera2 adapter for Raspberry Pi 5
 - Threaded non-blocking capture buffer to ensure lowest latency (< 100 ms)
 """
 
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Tuple, Optional, List
+import logging
 import threading
 import time
 import cv2
 import numpy as np
 
 from vps.config import CameraConfig
+
+logger = logging.getLogger("VPS.Camera")
 
 
 class CameraCaptureBase(ABC):
@@ -204,4 +207,181 @@ class MockCameraCapture(CameraCaptureBase):
 
     def release(self) -> None:
         self._is_open = False
+
+
+class Picamera2CameraCapture(CameraCaptureBase):
+    """Camera capture using Raspberry Pi Picamera2/libcamera backend (Sony IMX296)."""
+
+    def __init__(
+        self,
+        config: Optional[CameraConfig] = None,
+        use_threading: bool = True,
+    ) -> None:
+        self.cfg = config if config is not None else CameraConfig()
+        self.use_threading = use_threading
+        self._picam2 = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._is_open = False
+        self._lock = threading.Lock()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_timestamp: float = 0.0
+        self._frame_ready = False
+
+    @staticmethod
+    def is_available() -> bool:
+        """Return True if picamera2 is importable in the current environment."""
+        try:
+            import picamera2  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def open(self) -> bool:
+        """Open IMX296 / CSI camera via Picamera2 at configured resolution and FPS."""
+        try:
+            from picamera2 import Picamera2
+        except ImportError as e:
+            logger.warning("Picamera2 not available: %s", e)
+            return False
+
+        try:
+            self._picam2 = Picamera2()
+            video_cfg = self._picam2.create_video_configuration(
+                main={
+                    "size": (int(self.cfg.width), int(self.cfg.height)),
+                    "format": "BGR888",
+                },
+                controls={"FrameRate": float(self.cfg.fps)},
+            )
+            self._picam2.configure(video_cfg)
+            self._picam2.start()
+            self._is_open = True
+
+            if self.use_threading:
+                self._running = True
+                self._thread = threading.Thread(target=self._worker, daemon=True, name="VPS_Picamera2")
+                self._thread.start()
+            return True
+        except Exception as e:
+            logger.error("Failed to initialize Picamera2: %s", e)
+            self.release()
+            return False
+
+    def _worker(self) -> None:
+        """Background capture loop grabbing frames with monotonic timestamps."""
+        while self._running and self._picam2 is not None:
+            try:
+                frame = self._picam2.capture_array()
+                t_now = time.monotonic()
+                if frame is not None:
+                    with self._lock:
+                        self._latest_frame = frame
+                        self._latest_timestamp = max(t_now, self._latest_timestamp + 1e-6)
+                        self._frame_ready = True
+            except Exception:
+                time.sleep(0.005)
+
+    def read_frame(self) -> Tuple[bool, Optional[np.ndarray], float]:
+        """Return the newest unconsumed frame and its monotonic timestamp."""
+        if not self._is_open or self._picam2 is None:
+            return False, None, 0.0
+
+        if self.use_threading:
+            with self._lock:
+                if self._frame_ready and self._latest_frame is not None:
+                    self._frame_ready = False
+                    return True, self._latest_frame.copy(), self._latest_timestamp
+                return False, None, 0.0
+        else:
+            try:
+                frame = self._picam2.capture_array()
+                t_now = time.monotonic()
+                if frame is not None:
+                    return True, frame, t_now
+            except Exception:
+                pass
+            return False, None, 0.0
+
+    def release(self) -> None:
+        """Stop background capture and release Picamera2 resources."""
+        self._running = False
+        self._is_open = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        if self._picam2 is not None:
+            try:
+                self._picam2.stop()
+            except Exception:
+                pass
+            try:
+                self._picam2.close()
+            except Exception:
+                pass
+            self._picam2 = None
+
+
+class AutoCameraCapture(CameraCaptureBase):
+    """Selects OpenCV V4L2/USB capture or falls back to Picamera2 on Raspberry Pi CSI."""
+
+    def __init__(
+        self,
+        device_index: int | str = 0,
+        config: Optional[CameraConfig] = None,
+    ) -> None:
+        self.device_index = device_index
+        self.cfg = config if config is not None else CameraConfig()
+        self._backend: Optional[CameraCaptureBase] = None
+
+    def open(self) -> bool:
+        dev_str = str(self.device_index).lower().strip()
+        if dev_str == "mock":
+            self._backend = MockCameraCapture(fps=self.cfg.fps)
+            return self._backend.open()
+
+        if dev_str in ("picamera2", "libcamera", "csi"):
+            self._backend = Picamera2CameraCapture(config=self.cfg)
+            return self._backend.open()
+
+        try:
+            dev_arg: int | str = int(self.device_index)
+        except (ValueError, TypeError):
+            dev_arg = self.device_index
+
+        cv_cam = OpenCVCameraCapture(device_index=dev_arg, config=self.cfg)
+        if cv_cam.open():
+            self._backend = cv_cam
+            return True
+
+        # Raw V4L2 unicam nodes (/dev/video0) on Raspberry Pi Bookworm/Trixie require Picamera2
+        if Picamera2CameraCapture.is_available():
+            logger.info("OpenCV could not open %s; falling back to Picamera2 CSI backend", self.device_index)
+            pi_cam = Picamera2CameraCapture(config=self.cfg)
+            if pi_cam.open():
+                self._backend = pi_cam
+                return True
+
+        return False
+
+    def read_frame(self) -> Tuple[bool, Optional[np.ndarray], float]:
+        if self._backend is None:
+            return False, None, 0.0
+        return self._backend.read_frame()
+
+    def release(self) -> None:
+        if self._backend is not None:
+            self._backend.release()
+            self._backend = None
+
+
+def create_camera_capture(
+    device_index: int | str = 0,
+    config: Optional[CameraConfig] = None,
+) -> CameraCaptureBase:
+    """Create the appropriate camera capture backend for the given device specifier."""
+    cfg = config if config is not None else CameraConfig()
+    if str(device_index).lower().strip() == "mock":
+        return MockCameraCapture(fps=cfg.fps)
+    return AutoCameraCapture(device_index=device_index, config=cfg)
 

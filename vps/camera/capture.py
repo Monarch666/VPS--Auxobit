@@ -252,7 +252,8 @@ class Picamera2CameraCapture(CameraCaptureBase):
                     "size": (int(self.cfg.width), int(self.cfg.height)),
                     "format": "YUV420",
                 },
-                buffer_count=6,
+                buffer_count=4,
+                queue=False,
                 controls={"FrameRate": float(self.cfg.fps)},
             )
             self._picam2.configure(video_cfg)

@@ -155,6 +155,44 @@ class VIOVelocityEstimator:
         delta_p = p1_in - p0_derot  # shape (N, 2) [du, dv]
         median_du = float(np.median(delta_p[:, 0]))
         median_dv = float(np.median(delta_p[:, 1]))
+
+        # During climb/descent, radial expansion/contraction k*(p - c) biases np.median(delta_p)
+        # whenever tracked features are off-center. Fit delta_p = t + k*(p0_derot - c) robustly
+        # when features span enough of the image so translation is evaluated at principal point.
+        if num_inliers >= 12:
+            rel_p = p0_derot - np.array([self.cam_cfg.cx, self.cam_cfg.cy], dtype=np.float64)
+            spread_px = float(np.hypot(np.std(rel_p[:, 0]), np.std(rel_p[:, 1])))
+            if spread_px >= 40.0:
+                dx = rel_p[:, 0]
+                dy = rel_p[:, 1]
+                r2 = dx * dx + dy * dy
+                # Closed-form normal equations for [tu, tv, k] minimized over (du, dv):
+                # Minimize sum w_i * ((du_i - tu - k*dx_i)^2 + (dv_i - tv - k*dy_i)^2)
+                w = np.ones(num_inliers, dtype=np.float64)
+                for _ in range(3):
+                    sw = float(np.sum(w))
+                    if sw <= 1e-6:
+                        break
+                    mx = float(np.sum(w * dx) / sw)
+                    my = float(np.sum(w * dy) / sw)
+                    cx_d = dx - mx
+                    cy_d = dy - my
+                    denom = float(np.sum(w * (cx_d * cx_d + cy_d * cy_d)))
+                    if denom <= 1e-6:
+                        break
+                    mdu = float(np.sum(w * delta_p[:, 0]) / sw)
+                    mdv = float(np.sum(w * delta_p[:, 1]) / sw)
+                    numer = float(np.sum(w * (cx_d * (delta_p[:, 0] - mdu) + cy_d * (delta_p[:, 1] - mdv))))
+                    k_est = float(np.clip(numer / denom, -0.35, 0.35))
+                    tu_est = mdu - k_est * mx
+                    tv_est = mdv - k_est * my
+                    res_sq = (delta_p[:, 0] - (tu_est + k_est * dx)) ** 2 + (delta_p[:, 1] - (tv_est + k_est * dy)) ** 2
+                    mad = max(0.5, float(np.sqrt(np.median(res_sq))))
+                    w = 1.0 / np.maximum(1.0, np.sqrt(res_sq) / (2.0 * mad))
+                else:
+                    median_du = tu_est
+                    median_dv = tv_est
+
         trans_flow = np.array([median_du, median_dv], dtype=np.float64)
         median_flow_norm = float(np.hypot(median_du, median_dv))
 

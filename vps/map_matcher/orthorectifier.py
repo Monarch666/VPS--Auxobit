@@ -40,6 +40,7 @@ class OrthoResult:
     H_cam_to_ortho: np.ndarray  # (3, 3)
     is_valid: bool
     status_message: str = ""
+    valid_mask: Optional[np.ndarray] = None  # shape (H, W) uint8 (255 inside warped FOV, 0 on border)
 
 
 class FrameOrthorectifier:
@@ -82,7 +83,11 @@ class FrameOrthorectifier:
             [-sp,     cp * sr,                cp * cr]
         ], dtype=np.float64)
 
-    def compute_gradient_maps(self, gray_image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def compute_gradient_maps(
+        self,
+        gray_image: np.ndarray,
+        valid_mask: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """Compute normalized Sobel gradient magnitude and orientation maps.
 
         Bridges the appearance gap between live monsoon/green vegetation and dry reference maps.
@@ -91,11 +96,18 @@ class FrameOrthorectifier:
         gy = cv2.Sobel(gray_image, cv2.CV_32F, 0, 1, ksize=3)
 
         mag = cv2.magnitude(gx, gy)
-        p98 = float(np.percentile(mag, 98))
+        if valid_mask is not None:
+            inner = mag[valid_mask > 0]
+            p98 = float(np.percentile(inner, 98)) if inner.size > 0 else 0.0
+        else:
+            p98 = float(np.percentile(mag, 98))
         mag_norm = np.clip((mag / max(1e-4, p98)) * 255.0, 0, 255).astype(np.uint8)
 
         angle_rad = np.arctan2(gy, gx)
         angle_deg = np.mod(np.degrees(angle_rad), 180.0).astype(np.uint8)
+        if valid_mask is not None:
+            mag_norm[valid_mask == 0] = 0
+            angle_deg[valid_mask == 0] = 0
         return mag_norm, angle_deg
 
     def orthorectify(
@@ -218,8 +230,20 @@ class FrameOrthorectifier:
             )
             img_rect_bgr = cv2.cvtColor(img_rect_gray, cv2.COLOR_GRAY2BGR)
 
-        # 5. Compute Sobel gradient orientation and magnitude maps
-        grad_mag, grad_angle = self.compute_gradient_maps(img_rect_gray)
+        # 5. Build eroded valid-FOV mask so black padding edges never enter gradient or ORB maps
+        src_h, src_w = frame.shape[:2]
+        raw_mask = cv2.warpPerspective(
+            np.full((src_h, src_w), 255, dtype=np.uint8),
+            H_rect2cam,
+            (w_out, h_out),
+            flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        valid_mask = cv2.erode(raw_mask, np.ones((3, 3), dtype=np.uint8), iterations=2)
+
+        # 6. Compute Sobel gradient orientation and magnitude maps (interior only)
+        grad_mag, grad_angle = self.compute_gradient_maps(img_rect_gray, valid_mask=valid_mask)
 
         return OrthoResult(
             image_bgr=img_rect_bgr,
@@ -236,5 +260,6 @@ class FrameOrthorectifier:
             H_cam_to_ortho=H_cam2rect,
             is_valid=True,
             status_message="ORTHORECTIFICATION_SUCCESS",
+            valid_mask=valid_mask,
         )
 

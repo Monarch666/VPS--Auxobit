@@ -932,6 +932,196 @@ class TestE2EIntegration:
         assert p2.cep_95_m < 8.0
         assert p2.map_match_accepted >= 1
 
+    def test_ground_pad_climb_cruise_highres_imx296_e2e(self, tmp_path):
+        """Realistic E2E: IMX296 0.5x VIO, ground baro drift, 50Hz IMU + 10Hz cam, climb & cruise."""
+        import csv
+        import threading
+        import tifffile
+        from vps.main import VPSApplication
+        from vps.map_db.geotiff_parser import GeoTIFFParser
+        from vps.map_db.tiler import MapTiler
+        from vps.tools.evaluate import ShadowEvaluator
+
+        home_lat, home_lon = 19.80955, 75.28280
+        width_px, height_px = 1024, 1024
+        gsd_m = 0.28
+        dlon_px = gsd_m / (111412.84 * np.cos(np.radians(home_lat)))
+        dlat_px = gsd_m / 111132.954
+        top_lat = home_lat + (height_px / 2.0) * dlat_px
+        left_lon = home_lon - (width_px / 2.0) * dlon_px
+
+        rng = np.random.default_rng(123)
+        noise_low = rng.integers(45, 115, size=(height_px // 4, width_px // 4, 3), dtype=np.uint8)
+        sat_bgr = cv2.resize(noise_low, (width_px, height_px), interpolation=cv2.INTER_CUBIC)
+        for _ in range(320):
+            x0, y0 = int(rng.integers(20, width_px - 60)), int(rng.integers(20, height_px - 60))
+            w, h = int(rng.integers(12, 50)), int(rng.integers(12, 50))
+            col = tuple(int(c) for c in rng.integers(110, 250, size=3))
+            cv2.rectangle(sat_bgr, (x0, y0), (x0 + w, y0 + h), col, -1)
+            cv2.circle(sat_bgr, (x0 + w // 2, y0 + h // 2), max(3, min(w, h) // 3), (255, 240, 210), 2)
+
+        tif_path = tmp_path / "z19_site.tif"
+        extratags = [
+            (33550, "d", 3, (dlon_px, dlat_px, 0.0), True),
+            (33922, "d", 6, (0.0, 0.0, 0.0, left_lon, top_lat, 0.0), True),
+            (34735, "H", 16, (1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326), True),
+        ]
+        tifffile.imwrite(str(tif_path), cv2.cvtColor(sat_bgr, cv2.COLOR_BGR2RGB), photometric="rgb", extratags=extratags)
+
+        db_dir = tmp_path / "map_db_z19"
+        MapTiler(tile_size_px=512, overlap_ratio=0.15).build_database(
+            geotiff_path=tif_path,
+            output_dir=db_dir,
+            map_name="test_z19",
+            home_origin_deg=(home_lat, home_lon),
+        )
+
+        cfg = VPSConfig(mode="shadow")
+        cfg.camera.width = 1456
+        cfg.camera.height = 1088
+        cfg.camera.fx = 1207.2
+        cfg.camera.fy = 1199.1
+        cfg.camera.cx = 728.0
+        cfg.camera.cy = 544.0
+        cfg.camera.device_index = "mock"
+        cfg.mavlink.connection_string = "udpin:127.0.0.1:19995"
+        cfg.mavlink.feed_fc_ekf = False
+        cfg.logger.output_dir = str(tmp_path / "logs")
+        cfg.map.enabled = True
+        cfg.map.db_path = str(db_dir)
+        cfg.map.match_rate_hz = 2.0
+        cfg.map.min_inliers = 8
+        cfg.map.min_confidence = 0.25
+        cfg.map.min_altitude_m = 12.0
+        cfg.vtx.enabled = False
+
+        app = VPSApplication(config=cfg, phase1_only=False, record_session=True, save_images=False)
+        parser = GeoTIFFParser(home_lat, home_lon)
+        gmeta = GeoTIFFParser.extract_metadata(tif_path)
+        r_earth = GeoTIFFParser.WGS84_A
+
+        dt_cam, dt_imu = 0.10, 0.02
+        n_frames = 75  # 7.5 s mission: 0..1.5s pad w/ baro drift -> 1.5..3.5s climb to 22m -> 3.5..7.5s cruise
+
+        def state_at(t_rel: float):
+            if t_rel < 1.5:
+                return False, 0.06, np.array([0.0, 0.0, 0.0]), np.zeros(3), np.array([-0.005, 0.003, 0.0]), -1.1
+            if t_rel < 3.5:
+                u = (t_rel - 1.5) / 2.0
+                h = 0.06 + u * 21.94
+                vn, ve = 0.3, 0.2
+                pn, pe = vn * (t_rel - 1.5), ve * (t_rel - 1.5)
+                return True, h, np.array([pn, pe, -(h - 0.06)]), np.array([vn, ve, -10.97]), np.array([0.01, -0.02, 0.0]), (h - 0.06) - 1.1
+            tau = t_rel - 3.5
+            h = 22.0
+            vn, ve = 5.0, 2.0
+            pn, pe = 0.6 + vn * tau, 0.4 + ve * tau
+            return True, h, np.array([pn, pe, -(h - 0.06)]), np.array([vn, ve, 0.0]), np.array([0.02 * np.sin(tau), -0.04, 0.1]), (h - 0.06) - 1.0
+
+        u_c, v_c = np.meshgrid(np.arange(cfg.camera.width, dtype=np.float32), np.arange(cfg.camera.height, dtype=np.float32))
+        pts_h = np.stack([u_c, v_c, np.ones_like(u_c)], axis=-1).reshape(-1, 3)
+
+        class RealisticMockCamera:
+            def __init__(self):
+                self.idx = 0
+                self.t0 = time.monotonic()
+                self.armed = False
+                self.pos = np.zeros(3)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                pass
+
+            def read_frame(self):
+                if self.idx >= n_frames:
+                    time.sleep(0.01)
+                    return False, None, time.monotonic()
+                t_rel_end = self.idx * dt_cam
+                t_rel_start = max(0.0, t_rel_end - dt_cam)
+                n_sub = max(1, int(round((t_rel_end - t_rel_start) / dt_imu)))
+                for s_i in range(1, n_sub + 1):
+                    ts_rel = t_rel_start + s_i * ((t_rel_end - t_rel_start) / n_sub) if self.idx > 0 else 0.0
+                    _, _, p, v, att, baro = state_at(ts_rel)
+                    R_wb = app.orthorectifier.euler_to_R_wb(*att)
+                    f_b = R_wb.T @ np.array([0.0, 0.0, -9.80665]) + np.array([0.12, -0.10, 0.04])
+                    app.ring_buffer.add_sample(TelemetrySample(
+                        timestamp_s=self.t0 + ts_rel,
+                        gyro_rad_s=np.zeros(3),
+                        attitude_rpy_rad=att,
+                        vel_ned_mps=v,
+                        baro_alt_m=baro,
+                        pos_ned_m=p,
+                        accel_mps2=f_b,
+                    ))
+                armed, h, p, _, att, _ = state_at(t_rel_end)
+                self.armed, self.pos = armed, p
+                R_wb = app.orthorectifier.euler_to_R_wb(*att)
+                R_cw = app.vio_est.R_b2c @ R_wb.T
+                t_c = R_cw @ np.array([0.0, 0.0, max(0.2, h)])
+                H_cam2g = np.linalg.inv(cfg.camera.K @ np.column_stack([R_cw[:, 0], R_cw[:, 1], t_c]))
+                g_h = (H_cam2g @ pts_h.T).T
+                g_rel = g_h[:, :2] / g_h[:, 2:3]
+                lat_d = np.degrees(np.radians(home_lat) + (p[0] + g_rel[:, 0]) / r_earth)
+                lon_d = np.degrees(np.radians(home_lon) + (p[1] + g_rel[:, 1]) / (r_earth * np.cos(np.radians(home_lat))))
+                px_s = ((lon_d - gmeta.georef.origin_lon_deg) / gmeta.georef.dlon_deg_per_px).astype(np.float32).reshape(cfg.camera.height, cfg.camera.width)
+                py_s = ((gmeta.georef.origin_lat_deg - lat_d) / gmeta.georef.dlat_deg_per_px).astype(np.float32).reshape(cfg.camera.height, cfg.camera.width)
+                frame = cv2.remap(sat_bgr, px_s, py_s, cv2.INTER_LINEAR)
+                self.idx += 1
+                time.sleep(0.01)
+                return True, frame, self.t0 + t_rel_end
+
+        cam = RealisticMockCamera()
+        app.camera = cam
+
+        def get_fc_status():
+            lat_d, lon_d = parser.local_ned_to_wgs84(float(cam.pos[0]), float(cam.pos[1]))
+            return {
+                "heartbeat_seen": True,
+                "is_armed": cam.armed,
+                "flight_mode": "LOITER" if cam.armed else "STABILIZE",
+                "battery_voltage_v": 16.0,
+                "gps_fix_type": 3,
+                "gps_lat_deg": lat_d,
+                "gps_lon_deg": lon_d,
+                "gps_alt_m": 550.0,
+                "gps_eph_m": 0.9 if cam.armed else 2.1,
+                "gps_epv_m": 1.2,
+                "gps_satellites": 12,
+                "rangefinder_dist_m": -1.0,
+                "fc_boot_ms": 1000,
+            }
+
+        app.mavlink_bridge.get_fc_status = get_fc_status
+
+        assert app.start()
+        worker = threading.Thread(target=app.run_autonomous_flight, daemon=True)
+        worker.start()
+
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if cam.idx >= n_frames:
+                time.sleep(0.4)
+                break
+            time.sleep(0.05)
+
+        csv_path = app.session_logger.csv_path
+        app.stop()
+        worker.join(timeout=2.0)
+
+        ev = ShadowEvaluator(session_dir=csv_path.parent)
+        p1 = ev.evaluate_phase1()
+        p2 = ev.evaluate_phase2()
+        with open(csv_path, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == n_frames
+        assert p1.overall_rmse_m < 0.35
+        assert p1.pass_status is True
+        assert p2.cep_95_m < 4.5
+        assert p2.map_match_accepted == sum(1 for r in rows if r["map_match_accepted"] == "True")
+        assert app._reset_counter >= 1
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

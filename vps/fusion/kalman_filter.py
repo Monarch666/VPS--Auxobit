@@ -88,7 +88,7 @@ class TerrainRelativeKalmanFilter:
 
         # Kinematic model: dot(h) = -vel_d, dot(z_terrain) = 0
         climb_rate = -float(vel_d_mps)
-        self.x[0] += climb_rate * dt_s
+        self.x[0] = max(self.baseline_offset, float(self.x[0] + climb_rate * dt_s))
 
         # Process noise covariance Q
         # When hovering without vision, inflate terrain process noise to reflect drift
@@ -100,10 +100,24 @@ class TerrainRelativeKalmanFilter:
 
         # State transition F = Identity(2)
         self.P += Q
+        self.P[0, 0] = min(10.0, float(self.P[0, 0]))
+        self.P[1, 1] = min(2.0, float(self.P[1, 1]))
 
         # Decay confidence during prediction step if vision inactive
         if not self._is_vision_active:
             self._confidence = float(max(0.1, self._confidence * np.exp(-0.15 * dt_s)))
+
+    def reset_ground_state(self) -> None:
+        """Reset height and terrain states cleanly while stationary/disarmed on the ground."""
+        self.x[0] = self.baseline_offset
+        self.x[1] = 0.0
+        self.P = np.array([
+            [0.25, 0.0],
+            [0.0, 0.25],
+        ], dtype=np.float64)
+        self._confidence = 0.5
+        self._is_vision_active = False
+        self._mode_status = "GROUND_IDLE"
 
     def update_barometer(self, baro_alt_m: float) -> None:
         """Incorporate takeoff-relative barometric altitude measurement.
@@ -128,6 +142,7 @@ class TerrainRelativeKalmanFilter:
 
         # State update
         self.x += (K * nu).ravel()
+        self.x[0] = max(self.baseline_offset, float(self.x[0]))
 
         # Covariance update: P = (I - K * H) * P
         I_KH = np.eye(2) - K @ H

@@ -70,6 +70,10 @@ class VPSFusionEngine:
         self._last_baro_alt_m: Optional[float] = None
         self._last_keyframe_pts: Optional[np.ndarray] = None
 
+    def reset_ground_state(self) -> None:
+        """Reset Kalman filter ground height and terrain elevation while disarmed on pad."""
+        self.filter.reset_ground_state()
+
     def process_telemetry_and_frame(
         self,
         frame: np.ndarray,

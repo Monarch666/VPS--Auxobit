@@ -125,9 +125,17 @@ class VisionHeightPipeline:
         t_start = time.perf_counter()
 
         if frame.ndim == 3:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         else:
-            gray = frame
+            gray_full = frame
+
+        # Downscale 0.5x for tracking on high-res sensors (4x faster on Pi 4), preserving full-res coords
+        track_scale = 0.5 if gray_full.shape[1] >= 1000 else 1.0
+        inv_scale = 1.0 / track_scale
+        if track_scale != 1.0:
+            gray = cv2.resize(gray_full, (0, 0), fx=track_scale, fy=track_scale, interpolation=cv2.INTER_AREA)
+        else:
+            gray = gray_full
 
         # Step 1: If no active keyframe, initialize one
         if self.keyframe_mgr.active_keyframe is None:
@@ -161,7 +169,7 @@ class VisionHeightPipeline:
         # Step 2: Track features from keyframe to current frame
         track_res = self.tracker.track(kf.image_gray, gray, kf.features)
 
-        # Step 3: Evaluate keyframe status
+        # Step 3: Evaluate keyframe status (rescale flow displacement to full-res pixels)
         status = self.keyframe_mgr.check_keyframe_status(
             current_timestamp_s=timestamp_s,
             current_pos_ned_m=pos_ned_m,
@@ -172,43 +180,47 @@ class VisionHeightPipeline:
         height_est: Optional[float] = None
         confidence = 0.0
         is_valid = False
-        median_flow_px = track_res.median_flow_px
+        median_flow_px = float(track_res.median_flow_px * inv_scale)
         status_msg = status.reason
 
         inlier_pts_c: Optional[np.ndarray] = None
         if track_res.num_inliers > 0:
-            inlier_pts_c = track_res.pts_curr[track_res.inlier_mask]
+            inlier_pts_c = track_res.pts_curr[track_res.inlier_mask] * inv_scale
 
         # Step 4: If baseline threshold reached, compute height-from-flow
         if status.should_estimate_height and track_res.num_inliers >= 8:
-            # Inter-frame camera rotation R_k2c
-            R_w_b0 = self._euler_to_rotation_matrix(*kf.attitude_rpy_rad)
-            R_w_b1 = self._euler_to_rotation_matrix(*attitude_rpy_rad)
-            R_cam_rel = self.R_b2c @ (R_w_b1.T @ R_w_b0) @ self.R_c2b
-
-            inlier_pts_k = track_res.pts_prev[track_res.inlier_mask]
-
-            # De-rotate optical flow
-            _, flow_trans = self.derot_engine.compute_translational_flow(
-                inlier_pts_k, inlier_pts_c, R_cam_rel
-            )
-
             # Ground displacement in camera coordinates
+            R_w_b0 = self._euler_to_rotation_matrix(*kf.attitude_rpy_rad)
             delta_pos_w = pos_ned_m - kf.pos_ned_m
             delta_pos_b = R_w_b0.T @ delta_pos_w
             delta_pos_c = self.R_b2c @ delta_pos_b
+            horiz_disp = float(np.hypot(delta_pos_c[0], delta_pos_c[1]))
 
-            # Estimate metric height
-            flow_res = self.flow_engine.estimate_height(flow_trans, delta_pos_c)
-
-            if flow_res.is_valid:
-                height_est = flow_res.height_m
-                confidence = flow_res.confidence
-                is_valid = True
-                status_msg = "FLOW_HEIGHT_VALID"
-                self.keyframe_mgr.update_altitude_prior(flow_res.height_m)
+            # Skip planar flow-height during steep vertical climbs/descents where radial expansion biases height
+            if abs(float(delta_pos_c[2])) > 0.55 * max(0.05, horiz_disp):
+                status_msg = "FLOW_SKIPPED_STEEP_CLIMB"
             else:
-                status_msg = f"FLOW_REJECTED: {flow_res.status_message}"
+                R_w_b1 = self._euler_to_rotation_matrix(*attitude_rpy_rad)
+                R_cam_rel = self.R_b2c @ (R_w_b1.T @ R_w_b0) @ self.R_c2b
+
+                inlier_pts_k = track_res.pts_prev[track_res.inlier_mask] * inv_scale
+
+                # De-rotate optical flow
+                _, flow_trans = self.derot_engine.compute_translational_flow(
+                    inlier_pts_k, inlier_pts_c, R_cam_rel
+                )
+
+                # Estimate metric height
+                flow_res = self.flow_engine.estimate_height(flow_trans, delta_pos_c)
+
+                if flow_res.is_valid:
+                    height_est = flow_res.height_m
+                    confidence = flow_res.confidence
+                    is_valid = True
+                    status_msg = "FLOW_HEIGHT_VALID"
+                    self.keyframe_mgr.update_altitude_prior(flow_res.height_m)
+                else:
+                    status_msg = f"FLOW_REJECTED: {flow_res.status_message}"
 
         # Step 5: Check if keyframe should be reset or replenished
         if status.should_reset_keyframe:

@@ -271,6 +271,13 @@ class MAVLinkBridge:
                 alt = float(msg.alt)
                 if self._baro_ground_offset is None:
                     self._baro_ground_offset = alt
+                else:
+                    with self._state_lock:
+                        armed = bool(self._fc_status["is_armed"])
+                        hb_seen = bool(self._fc_status["heartbeat_seen"])
+                    # Continuously tare slow barometric pressure drift while disarmed on the launch pad
+                    if hb_seen and not armed and abs(alt - self._baro_ground_offset) < 5.0:
+                        self._baro_ground_offset = 0.98 * self._baro_ground_offset + 0.02 * alt
                 # Keep relative baro updated whenever GLOBAL_POSITION_INT is not providing it
                 if self._home_lat_deg is None or self._has_local_pos_ned:
                     self._latest_baro = alt - self._baro_ground_offset

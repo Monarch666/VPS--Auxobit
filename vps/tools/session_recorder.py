@@ -280,7 +280,7 @@ class ShadowSessionRecorder:
         if self.save_images:
             self._frame_writer = AsynchronousFrameWriter(
                 images_dir=self.images_dir,
-                jpeg_quality=85,
+                jpeg_quality=75,
             )
             self._frame_writer.start()
 

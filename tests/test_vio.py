@@ -100,6 +100,30 @@ class TestVIOVelocityEstimator:
 
         assert abs(res.vel_ned_mps[1] - speed_east) < 0.25
 
+    def test_radial_climb_decoupling_on_offcenter_features(self):
+        """Pure vertical climb with off-center features must not hallucinate horizontal velocity."""
+        height = 10.0
+        dt = 0.1
+        scale = 10.0 / 10.8  # Climbing cleanly upward
+
+        u, v = np.meshgrid(np.linspace(150, 1250, 12), np.linspace(450, 980, 8))
+        p0 = np.column_stack([u.ravel(), v.ravel()])
+        center = np.array([self.cam_cfg.cx, self.cam_cfg.cy])
+        p1 = center + scale * (p0 - center)
+
+        res = self.estimator.estimate_velocity_from_flow(
+            pts0=p0,
+            pts1=p1,
+            inlier_mask=np.ones(len(p0), dtype=bool),
+            H_derot=np.eye(3),
+            height_agl_m=height,
+            dt_s=dt,
+            attitude_rpy_rad=np.zeros(3),
+            timestamp_s=3.0,
+            compute_homography_alternative=False,
+        )
+        assert float(np.hypot(res.vel_ned_mps[0], res.vel_ned_mps[1])) < 0.15
+
 
 class TestESEKF:
     def setup_method(self):
@@ -180,4 +204,27 @@ class TestESEKF:
         assert not accepted
         # State should not be corrupted
         assert np.linalg.norm(ekf.state.vel_ned_mps) < 0.1
+
+    def test_esekf_substep_low_fps_and_ground_reset_and_ahrs(self):
+        """Low-rate predict_imu sub-steps cleanly; ground reset & AHRS leveling bound drift."""
+        ekf = ErrorStateEKF(initial_pos_ned=np.zeros(3), initial_vel_ned=np.array([4.0, 0.0, 0.0]))
+        g = 9.80665
+        # Propagate 1.0 s at 10 Hz (0.10 s steps > old 0.05 s clip)
+        ekf.predict_imu(np.array([0.0, 0.0, -g]), np.zeros(3), timestamp_s=0.0)
+        for i in range(1, 11):
+            ekf.predict_imu(np.array([0.0, 0.0, -g]), np.zeros(3), timestamp_s=i * 0.1)
+        assert abs(ekf.state.pos_ned_m[0] - 4.0) < 0.2
+
+        # AHRS attitude update brings tilted state back toward level
+        ekf.align_attitude(0.15, -0.12, 0.0, sigma_att_rad=0.1)
+        for _ in range(10):
+            assert ekf.update_ahrs_attitude(0.0, 0.0, sigma_rp_rad=0.05)
+        rpy = ekf.state.roll_pitch_yaw_rad
+        assert abs(rpy[0]) < 0.03 and abs(rpy[1]) < 0.03
+
+        # Ground reset restores clean position, zero velocity, and clears cross-covariance
+        ekf.reset_ground_state(np.array([0.0, 0.0, -0.06]), attitude_rpy_rad=np.zeros(3))
+        assert np.allclose(ekf.state.vel_ned_mps, 0.0)
+        assert np.allclose(ekf.state.pos_ned_m, [0.0, 0.0, -0.06])
+        assert np.allclose(ekf.P[0:3, 3:6], 0.0)
 

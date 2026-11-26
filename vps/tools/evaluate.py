@@ -127,10 +127,16 @@ class ShadowEvaluator:
             for r in reader:
                 parsed = {}
                 for k, v in r.items():
-                    try:
-                        parsed[k] = float(v)
-                    except (ValueError, TypeError):
-                        parsed[k] = v
+                    low = v.strip().lower() if isinstance(v, str) else ""
+                    if low == "true":
+                        parsed[k] = True
+                    elif low == "false":
+                        parsed[k] = False
+                    else:
+                        try:
+                            parsed[k] = float(v)
+                        except (ValueError, TypeError):
+                            parsed[k] = v
                 rows.append(parsed)
         return rows
 

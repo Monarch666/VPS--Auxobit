@@ -94,6 +94,7 @@ class MapConfig:
     match_rate_hz: float = 1.0
     min_inliers: int = 10
     min_confidence: float = 0.25
+    min_altitude_m: float = 12.0
 
 
 @dataclass

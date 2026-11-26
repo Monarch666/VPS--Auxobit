@@ -99,7 +99,8 @@ class ConfidenceEvaluator:
 
         # 6. Texture contrast factor [0, 1]
         if image_gray is not None:
-            img_std = float(np.std(image_gray))
+            sample_gray = image_gray[::4, ::4] if image_gray.size > 200_000 else image_gray
+            img_std = float(np.std(sample_gray))
             c_tex = float(np.clip((img_std - self.min_texture_std) / 20.0, 0.0, 1.0))
         else:
             c_tex = 1.0

@@ -163,3 +163,14 @@ class TelemetryRingBuffer:
 
             return np.array(selected_gyros, dtype=np.float64), np.array(selected_times, dtype=np.float64)
 
+    def get_samples_between(
+        self,
+        t_start_s: float,
+        t_end_s: float,
+    ) -> List[TelemetrySample]:
+        """Return buffered TelemetrySample objects in (t_start_s, t_end_s] order."""
+        t0 = min(t_start_s, t_end_s) + self.time_offset_s
+        t1 = max(t_start_s, t_end_s) + self.time_offset_s
+        with self._lock:
+            return [s for s in self._samples if t0 < s.timestamp_s <= t1]
+

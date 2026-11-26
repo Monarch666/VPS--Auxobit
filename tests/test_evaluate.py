@@ -57,6 +57,8 @@ def test_shadow_evaluator_metrics_and_html(tmp_path):
     assert p2.total_samples == 50
     assert p2.pos_2d_rmse_m < 0.5
     assert p2.cep_95_m < 1.0
+    assert p2.map_match_attempts == 0
+    assert p2.map_match_accepted == 0
     assert p2.pass_status is True
 
     # 3. Virtual Denial

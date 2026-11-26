@@ -248,6 +248,9 @@ class ErrorStateEKF:
     ) -> NavState:
         """Propagate nominal kinematics and error covariance using IMU measurements.
 
+        Sub-steps intervals larger than 20 ms (up to 0.5 s) so low camera frame rates
+        do not silently discard elapsed time or angular motion.
+
         Args:
             accel_meas_mps2: Measured specific force in Body frame [ax, ay, az] (m/s^2).
             gyro_meas_rad_s: Measured angular rate in Body frame [p, q, r] (rad/s).
@@ -258,26 +261,37 @@ class ErrorStateEKF:
         """
         with self._lock:
             if self._last_imu_timestamp_s is not None:
-                dt = max(0.0005, min(0.05, timestamp_s - self._last_imu_timestamp_s))
+                raw_dt = timestamp_s - self._last_imu_timestamp_s
+                if raw_dt <= 0.0:
+                    return self.state
+                total_dt = max(0.0005, min(0.5, raw_dt))
             else:
-                dt = 0.01  # default 100 Hz
+                total_dt = 0.01  # default 100 Hz
+
+            n_sub = max(1, int(np.ceil(total_dt / 0.02)))
+            sub_dt = total_dt / n_sub
+            start_t = timestamp_s - total_dt
+            accel_copy = accel_meas_mps2.copy()
+            gyro_copy = gyro_meas_rad_s.copy()
+
+            for step_i in range(n_sub):
+                step_t = start_t + (step_i + 1) * sub_dt
+                self.state, self.P = self._propagate_kinematics_step(
+                    self.state, self.P, accel_copy, gyro_copy, sub_dt
+                )
+                self.state.timestamp_s = step_t
+
+                # Buffer IMU measurements for delayed-state re-propagation
+                self._imu_buffer.append((step_t, accel_copy, gyro_copy))
+                if len(self._imu_buffer) > self._max_history_len:
+                    self._imu_buffer.pop(0)
+
+                # Record state history for delayed-state fusion
+                self._history_buffer.append((step_t, self._clone_nav_state(self.state), self.P.copy()))
+                if len(self._history_buffer) > self._max_history_len:
+                    self._history_buffer.pop(0)
+
             self._last_imu_timestamp_s = timestamp_s
-
-            self.state, self.P = self._propagate_kinematics_step(
-                self.state, self.P, accel_meas_mps2, gyro_meas_rad_s, dt
-            )
-            self.state.timestamp_s = timestamp_s
-
-            # Buffer IMU measurements for delayed-state re-propagation
-            self._imu_buffer.append((timestamp_s, accel_meas_mps2.copy(), gyro_meas_rad_s.copy()))
-            if len(self._imu_buffer) > self._max_history_len:
-                self._imu_buffer.pop(0)
-
-            # Record state history for delayed-state fusion
-            self._history_buffer.append((timestamp_s, self._clone_nav_state(self.state), self.P.copy()))
-            if len(self._history_buffer) > self._max_history_len:
-                self._history_buffer.pop(0)
-
             return self.state
 
     def update_vio_velocity(
@@ -325,8 +339,10 @@ class ErrorStateEKF:
                     if d2 > self.cfg.gate_vio_vel_chi2:
                         self._consecutive_rejected_vio += 1
                         if self._consecutive_rejected_vio >= 3:
-                            # Recovery: state diverged from vision stream, perform soft reset to measurement
+                            # Recovery: state diverged from vision stream, perform soft reset without pos kick
                             self.state.vel_ned_mps = vel_vio_ned_mps.copy()
+                            self.P[:, 3:6] = 0.0
+                            self.P[3:6, :] = 0.0
                             self.P[3:6, 3:6] = np.eye(3) * (effective_sigma * 2.0) ** 2
                             self._consecutive_rejected_vio = 0
                             return True
@@ -375,6 +391,71 @@ class ErrorStateEKF:
             self.P[6:9, 6:9] = np.eye(3, dtype=np.float64) * (float(sigma_att_rad) ** 2)
             if self._history_buffer and abs(self._history_buffer[-1][0] - self.state.timestamp_s) < 1e-6:
                 self._history_buffer[-1] = (self.state.timestamp_s, self._clone_nav_state(self.state), self.P.copy())
+
+    def reset_ground_state(
+        self,
+        pos_ned_m: np.ndarray,
+        attitude_rpy_rad: Optional[np.ndarray] = None,
+    ) -> None:
+        """Reset position, velocity, attitude, and covariance while stationary on the pad."""
+        with self._lock:
+            self.state.pos_ned_m = np.array(pos_ned_m, dtype=np.float64).reshape((3,))
+            self.state.vel_ned_mps[:] = 0.0
+            if attitude_rpy_rad is not None:
+                self.align_attitude(
+                    roll_rad=float(attitude_rpy_rad[0]),
+                    pitch_rad=float(attitude_rpy_rad[1]),
+                    yaw_rad=float(attitude_rpy_rad[2]),
+                    sigma_att_rad=0.05,
+                )
+            self.P.fill(0.0)
+            self.P[0:3, 0:3] = np.eye(3, dtype=np.float64) * 0.25
+            self.P[3:6, 3:6] = np.eye(3, dtype=np.float64) * 0.04
+            self.P[6:9, 6:9] = np.eye(3, dtype=np.float64) * (0.05 ** 2)
+            self.P[9:12, 9:12] = np.eye(3, dtype=np.float64) * (0.1 ** 2)
+            self.P[12:15, 12:15] = np.eye(3, dtype=np.float64) * (0.01 ** 2)
+            self._imu_buffer.clear()
+            self._history_buffer.clear()
+            self._last_imu_timestamp_s = None
+            self._consecutive_rejected_vio = 0
+
+    def update_ahrs_attitude(
+        self,
+        roll_rad: float,
+        pitch_rad: float,
+        sigma_rp_rad: float = 0.08,
+    ) -> bool:
+        """Fuse FC AHRS roll/pitch leveling constraint so tilt errors do not leak gravity."""
+        with self._lock:
+            rpy = self.state.roll_pitch_yaw_rad
+            nu_rp = np.array([
+                float((roll_rad - rpy[0] + np.pi) % (2.0 * np.pi) - np.pi),
+                float((pitch_rad - rpy[1] + np.pi) % (2.0 * np.pi) - np.pi),
+            ], dtype=np.float64)
+
+            R_rp = np.eye(2, dtype=np.float64) * (float(sigma_rp_rad) ** 2)
+            H = np.zeros((2, 15), dtype=np.float64)
+            H[0, 6] = 1.0
+            H[1, 7] = 1.0
+
+            S = H @ self.P @ H.T + R_rp
+            try:
+                S_inv = np.linalg.inv(S)
+            except np.linalg.LinAlgError:
+                return False
+
+            if self.cfg.gate_compass_chi2 > 0:
+                d2 = float(nu_rp.T @ S_inv @ nu_rp)
+                if d2 > max(20.0, self.cfg.gate_compass_chi2 * 2.0):
+                    return False
+
+            K = self.P @ H.T @ S_inv
+            delta_x = K @ nu_rp
+            I_KH = np.eye(15, dtype=np.float64) - K @ H
+            self.P = I_KH @ self.P @ I_KH.T + K @ R_rp @ K.T
+            self.P = 0.5 * (self.P + self.P.T)
+            self._inject_and_reset(delta_x)
+            return True
 
     def update_compass_yaw(
         self,

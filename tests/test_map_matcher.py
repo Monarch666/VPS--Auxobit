@@ -278,3 +278,32 @@ class TestDelayedStateEKF:
         assert accepted is False
         # State must remain untouched
         assert ekf.state.pos_ned_m[0] == pytest.approx(100.0, abs=1.0)
+
+
+def test_ortho_border_mask_prevents_false_phase_correlation() -> None:
+    """Verify orthorectifier masks padding borders and matcher rejects tiny low-altitude views."""
+    rectifier = FrameOrthorectifier()
+    # Flat uniform bright frame whose only strong contrast would be its 0-padded outer border
+    uniform = np.full((1088, 1456, 3), 180, dtype=np.uint8)
+    ortho = rectifier.orthorectify(uniform, height_agl_m=18.0, attitude_rpy_rad=np.zeros(3), target_gsd_m_per_px=0.56)
+    assert ortho.valid_mask is not None
+    # Exterior gradient pixels must remain zero (no artificial border rectangle)
+    assert np.all(ortho.grad_mag[ortho.valid_mask == 0] == 0)
+
+    tile_img = np.random.default_rng(7).integers(30, 220, size=(512, 512), dtype=np.uint8)
+    meta = MapTileMetadata(
+        tile_id="t0", grid_row=0, grid_col=0, pixel_bounds=(0, 0, 512, 512),
+        ned_bounds_m=(-140.0, -140.0, 140.0, 140.0), wgs84_bounds_deg=(19.8, 75.28, 19.81, 75.29),
+        width_m=280.0, height_m=280.0, gsd_m_per_px=0.56,
+        image_file="m.png", feature_file="f.npz", num_orb_features=0, num_akaze_features=0,
+    )
+    tile = TileLookupResult(
+        metadata=meta, image_bgr=cv2.cvtColor(tile_img, cv2.COLOR_GRAY2BGR), image_gray=tile_img,
+        kp_orb=np.empty((0, 2), dtype=np.float32), desc_orb=np.empty((0, 32), dtype=np.uint8),
+        kp_akaze=np.empty((0, 2), dtype=np.float32), desc_akaze=np.empty((0, 61), dtype=np.uint8),
+        grad_mag=cv2.Sobel(tile_img, cv2.CV_8U, 1, 1), grad_angle=np.zeros_like(tile_img),
+    )
+    matcher = MapMatcher(min_inliers_feature=10)
+    res = matcher.match_frame_to_map(ortho, [tile], np.zeros(2), search_radius_m=200.0)
+    assert res.is_valid is False
+    assert res.status_message in ("FOOTPRINT_TOO_SMALL_FOR_GSD", "LOW_GRADIENT_TEXTURE", "NO_VALID_MATCH_FOUND")

@@ -101,3 +101,21 @@ class TestFusionEngineSimulation:
         assert res["hover_detected"]
         assert res["textureless_fallback"]
         assert plot_path.is_file()
+
+
+def test_kalman_ground_reset_and_terrain_bound_on_baro_drift():
+    """Verify ground reset prevents pre-arm baro drift from poisoning z_terrain at takeoff."""
+    kf = TerrainRelativeKalmanFilter(initial_height_m=0.06, initial_terrain_m=0.0, baseline_ground_offset_m=0.06)
+
+    # Simulate 100s on ground with -1.6m baro drift
+    for _ in range(100):
+        kf.predict(dt_s=1.0, vel_d_mps=0.0, is_hover=True)
+        kf.update_barometer(baro_alt_m=-1.6)
+        assert kf.x[0] >= kf.baseline_offset
+        assert kf.P[1, 1] <= 2.0 + 1e-9
+
+    # Ground reset on pad cleanly restores initial ground state & tight covariance
+    kf.reset_ground_state()
+    assert abs(kf.x[0] - 0.06) < 1e-6
+    assert abs(kf.x[1]) < 1e-6
+    assert kf.P[1, 1] <= 0.25 + 1e-9

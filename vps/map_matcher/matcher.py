@@ -46,10 +46,10 @@ class MapMatcher:
     def __init__(
         self,
         min_inliers_feature: int = 10,
-        min_phase_correlation_peak: float = 0.15,
+        min_phase_correlation_peak: float = 0.32,
         ransac_reproj_thresh_px: float = 3.0,
         base_feature_sigma_m: float = 8.0,
-        base_phase_sigma_m: float = 12.0,
+        base_phase_sigma_m: float = 16.0,
     ) -> None:
         """Initialize map matcher.
 
@@ -116,8 +116,8 @@ class MapMatcher:
                 status_message="EMPTY_INPUT_OR_NO_TILES",
             )
 
-        # Extract features from live rectified frame
-        kp_live, desc_live = self.orb.detectAndCompute(ortho.image_gray, None)
+        # Extract features from live rectified frame (mask out artificial border padding)
+        kp_live, desc_live = self.orb.detectAndCompute(ortho.image_gray, ortho.valid_mask)
         if desc_live is None or len(kp_live) < self.min_inliers:
             # Low feature count -> attempt phase correlation fallback immediately
             return self._fallback_phase_correlation(
@@ -248,6 +248,26 @@ class MapMatcher:
         h_live, w_live = live_grad.shape[:2]
         if h_live < 32 or w_live < 32:
             return self._empty_result(timestamp_s, pos_prior_ned_m, t_start, "LIVE_VIEW_TOO_SMALL")
+
+        valid_px_count = int(h_live * w_live)
+        if ortho.valid_mask is not None:
+            ys, xs = np.where(ortho.valid_mask > 0)
+            if ys.size == 0:
+                return self._empty_result(timestamp_s, pos_prior_ned_m, t_start, "NO_VALID_ORTHO_PIXELS")
+            valid_px_count = int(ys.size)
+            valid_frac = float(valid_px_count / max(1, h_live * w_live))
+            span_w = int(xs.max() - xs.min() + 1)
+            span_h = int(ys.max() - ys.min() + 1)
+            # Enforce large pixel span on high-resolution maps (<= 2 m/px) where low-altitude
+            # crops otherwise degenerate into small padded rectangles inside the 64x64 grid.
+            if ortho.gsd_m_per_px <= 2.0 and (valid_frac < 0.18 or span_w < 48 or span_h < 40):
+                return self._empty_result(timestamp_s, pos_prior_ned_m, t_start, "FOOTPRINT_TOO_SMALL_FOR_GSD")
+            if valid_px_count < 16:
+                return self._empty_result(timestamp_s, pos_prior_ned_m, t_start, "FOOTPRINT_TOO_SMALL_FOR_GSD")
+
+        min_grad_px = 80 if ortho.gsd_m_per_px <= 2.0 else max(16, int(0.25 * valid_px_count))
+        if int(np.count_nonzero(live_grad > 20)) < min_grad_px:
+            return self._empty_result(timestamp_s, pos_prior_ned_m, t_start, "LOW_GRADIENT_TEXTURE")
 
         hann = cv2.createHanningWindow((w_live, h_live), cv2.CV_32F)
         live_float = np.float32(live_grad)

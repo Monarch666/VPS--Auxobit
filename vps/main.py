@@ -168,6 +168,7 @@ class VPSApplication:
         self._prev_vio_pts: Optional[np.ndarray] = None
         self._prev_vio_att: Optional[np.ndarray] = None
         self._prev_vio_time: Optional[float] = None
+        self._last_ekf_imu_t: Optional[float] = None
 
         # 9. Phase 2: Offline Map DB & Absolute Map Matcher (Background Async Worker)
         self.map_db: Optional[RuntimeMapDB] = None
@@ -458,15 +459,43 @@ class VPSApplication:
                 (not self.phase1_only and not self._ekf_geo_aligned and self._map_geo_parser is not None)
                 or (self.session_logger is not None and isinstance(self.session_logger, ShadowSessionRecorder))
                 or (self.vtx_hud is not None)
+                or True
             )
-            fc_status: Optional[Dict[str, Any]] = self.mavlink_bridge.get_fc_status() if need_fc_status else None
+            fc_status: Optional[Dict[str, Any]] = self.mavlink_bridge.get_fc_status()
+
+            # Reset ground height/terrain baseline continuously while FC confirms disarmed & grounded on pad
+            is_grounded_pad = bool(
+                fc_status.get("heartbeat_seen")
+                and not fc_status.get("is_armed")
+                and abs(float(telem.baro_alt_m)) < 3.0
+                and abs(float(telem.vel_ned_mps[2])) < 0.25
+                and float(np.hypot(telem.vel_ned_mps[0], telem.vel_ned_mps[1])) < 0.4
+            )
+            if is_grounded_pad:
+                self.fusion_engine.reset_ground_state()
+                h_agl = self.cfg.camera.baseline_ground_offset_m
+                fusion_out.height_agl_m = float(h_agl)
+                fusion_out.terrain_elevation_m = float(self.fusion_engine.filter.x[1])
+                fusion_out.variance_m2 = float(self.fusion_engine.filter.P[0, 0])
+                if not self.phase1_only:
+                    with self._ekf_lock:
+                        self.ekf.reset_ground_state(
+                            pos_ned_m=np.array(
+                                [float(telem.pos_ned_m[0]), float(telem.pos_ned_m[1]), -h_agl],
+                                dtype=np.float64,
+                            ),
+                            attitude_rpy_rad=telem.attitude_rpy_rad,
+                        )
+                        self._ekf_yaw_aligned = True
+                        self._last_ekf_imu_t = t_capture
 
             if not self.phase1_only:
-                if not self._ekf_geo_aligned and self._map_geo_parser is not None and fc_status is not None:
+                if (not self._ekf_geo_aligned or is_grounded_pad) and self._map_geo_parser is not None and fc_status is not None:
                     gps_fix = int(fc_status.get("gps_fix_type", 0))
+                    gps_eph = float(fc_status.get("gps_eph_m", 99.0))
                     gps_lat = float(fc_status.get("gps_lat_deg", 0.0))
                     gps_lon = float(fc_status.get("gps_lon_deg", 0.0))
-                    if gps_fix >= 3 and (abs(gps_lat) > 1e-5 or abs(gps_lon) > 1e-5):
+                    if gps_fix >= 3 and (abs(gps_lat) > 1e-5 or abs(gps_lon) > 1e-5) and (not self._ekf_geo_aligned or gps_eph <= 2.5):
                         n_off, e_off = self._map_geo_parser.wgs84_to_local_ned(gps_lat, gps_lon)
                         if float(np.hypot(n_off, e_off)) <= 5000.0:
                             # Preserve FC Local NED frame inside EKF while recording offset to Map DB NED
@@ -474,11 +503,12 @@ class VPSApplication:
                                 [n_off - float(telem.pos_ned_m[0]), e_off - float(telem.pos_ned_m[1])],
                                 dtype=np.float64,
                             )
-                            self._ekf_geo_aligned = True
-                            logger.info(
-                                "Aligned Map DB offset: N=%.2fm, E=%.2fm (GPS %.6f, %.6f)",
-                                self._map_origin_offset_ne[0], self._map_origin_offset_ne[1], gps_lat, gps_lon,
-                            )
+                            if not self._ekf_geo_aligned:
+                                self._ekf_geo_aligned = True
+                                logger.info(
+                                    "Aligned Map DB offset: N=%.2fm, E=%.2fm (GPS %.6f, %.6f)",
+                                    self._map_origin_offset_ne[0], self._map_origin_offset_ne[1], gps_lat, gps_lon,
+                                )
 
                 with self._ekf_lock:
                     # Align EKF attitude and altitude before pushing first live history snapshot
@@ -491,28 +521,49 @@ class VPSApplication:
                         self.ekf.update_height(height_agl_m=h_agl, bypass_gate=True)
                         self._ekf_yaw_aligned = True
 
-                    # 2. ES-EKF High-Rate IMU Propagation
-                    self.ekf.predict_imu(
-                        accel_meas_mps2=telem.accel_mps2,
-                        gyro_meas_rad_s=telem.gyro_rad_s,
-                        timestamp_s=t_capture,
-                    )
+                    if not is_grounded_pad:
+                        # 2. ES-EKF High-Rate IMU Propagation using all buffered telemetry samples since last frame
+                        if self._last_ekf_imu_t is not None and t_capture > self._last_ekf_imu_t:
+                            inter_samples = self.ring_buffer.get_samples_between(self._last_ekf_imu_t, t_capture)
+                            for s in inter_samples:
+                                if s.timestamp_s < t_capture - 1e-4:
+                                    self.ekf.predict_imu(
+                                        accel_meas_mps2=s.accel_mps2,
+                                        gyro_meas_rad_s=s.gyro_rad_s,
+                                        timestamp_s=s.timestamp_s,
+                                    )
+                        self.ekf.predict_imu(
+                            accel_meas_mps2=telem.accel_mps2,
+                            gyro_meas_rad_s=telem.gyro_rad_s,
+                            timestamp_s=t_capture,
+                        )
+                        self._last_ekf_imu_t = t_capture
 
-                    # 3. ES-EKF Compass Heading Update
-                    self.ekf.update_compass_yaw(yaw_compass_rad=float(telem.attitude_rpy_rad[2]))
+                        # 3. ES-EKF Attitude Stabilization (Compass Yaw + AHRS Roll/Pitch)
+                        self.ekf.update_compass_yaw(yaw_compass_rad=float(telem.attitude_rpy_rad[2]))
+                        self.ekf.update_ahrs_attitude(
+                            roll_rad=float(telem.attitude_rpy_rad[0]),
+                            pitch_rad=float(telem.attitude_rpy_rad[1]),
+                        )
 
-                    # 5. ES-EKF Vertical Position Update (Height AGL)
-                    self.ekf.update_height(height_agl_m=h_agl)
+                        # 5. ES-EKF Vertical Position Update (Height AGL)
+                        self.ekf.update_height(height_agl_m=h_agl)
 
-                # 6. Phase 2: Frame-to-Frame Metric VIO Velocity Estimation
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+                # 6. Phase 2: Frame-to-Frame Metric VIO Velocity Estimation (0.5x resolution on high-res sensors)
+                gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+                vio_scale = 0.5 if gray_full.shape[1] >= 1000 else 1.0
+                inv_vio_scale = 1.0 / vio_scale
+                if vio_scale != 1.0:
+                    gray = cv2.resize(gray_full, (0, 0), fx=vio_scale, fy=vio_scale, interpolation=cv2.INTER_AREA)
+                else:
+                    gray = gray_full
 
                 if h_agl > 0.3 and self._prev_vio_gray is not None and self._prev_vio_pts is not None and len(self._prev_vio_pts) >= 8:
                     dt_vio = t_capture - (self._prev_vio_time if self._prev_vio_time is not None else (t_capture - 1.0 / 30.0))
                     if dt_vio > 0.001:
                         track_res = self.vio_tracker.track(self._prev_vio_gray, gray, self._prev_vio_pts)
                         vio_inliers = int(track_res.num_inliers)
-                        vio_flow_px = float(track_res.median_flow_px)
+                        vio_flow_px = float(track_res.median_flow_px * inv_vio_scale)
                         if track_res.num_inliers >= 8 and self._prev_vio_att is not None:
                             R_w_b0 = self.vio_est.euler_to_R_wb(*self._prev_vio_att)
                             R_w_b1 = self.vio_est.euler_to_R_wb(*telem.attitude_rpy_rad)
@@ -521,8 +572,8 @@ class VPSApplication:
 
                             try:
                                 vio_res = self.vio_est.estimate_velocity_from_flow(
-                                    pts0=track_res.pts_prev,
-                                    pts1=track_res.pts_curr,
+                                    pts0=track_res.pts_prev * inv_vio_scale,
+                                    pts1=track_res.pts_curr * inv_vio_scale,
                                     inlier_mask=track_res.inlier_mask,
                                     H_derot=H_derot,
                                     height_agl_m=h_agl,
@@ -543,12 +594,17 @@ class VPSApplication:
 
                 # Refresh tracking features for next frame
                 self._prev_vio_pts = self.vio_tracker.detect_features(gray)
-                self._prev_vio_gray = gray.copy()
+                self._prev_vio_gray = gray.copy() if vio_scale == 1.0 else gray
                 self._prev_vio_att = telem.attitude_rpy_rad.copy()
                 self._prev_vio_time = t_capture
 
-                # 7. Asynchronous Map Matcher Job Queue (1-2 Hz)
-                if self.map_db is not None and (t_capture - self._last_map_match_time) >= (1.0 / self.cfg.map.match_rate_hz):
+                # 7. Asynchronous Map Matcher Job Queue (1-2 Hz, above min_altitude_m)
+                min_map_alt = float(getattr(self.cfg.map, "min_altitude_m", 12.0))
+                if (
+                    self.map_db is not None
+                    and h_agl >= min_map_alt
+                    and (t_capture - self._last_map_match_time) >= (1.0 / self.cfg.map.match_rate_hz)
+                ):
                     with self._ekf_lock:
                         pos_prior_copy = self.ekf.state.pos_ned_m.copy()
                         reset_cnt_copy = self._reset_counter

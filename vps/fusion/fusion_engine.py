@@ -37,6 +37,7 @@ class FusionOutput:
     vision_height_m: Optional[float] = None
     num_inliers: int = 0
     median_flow_px: float = 0.0
+    tracked_points: Optional[np.ndarray] = None
 
 
 class VPSFusionEngine:
@@ -170,4 +171,5 @@ class VPSFusionEngine:
             vision_height_m=(flow_res.height_agl_m if (flow_res.is_valid and flow_res.height_agl_m is not None) else None),
             num_inliers=int(flow_res.num_inliers),
             median_flow_px=float(flow_res.median_flow_px),
+            tracked_points=flow_res.tracked_points,
         )

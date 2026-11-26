@@ -122,3 +122,41 @@ class TestSITLIntegration:
         assert res["ring_buffer_samples"] >= 50
         assert plot_path.is_file()
 
+
+def test_mavlink_bridge_vfr_hud_updates_baro_even_with_local_pos_ned():
+    """Verify VFR_HUD baro stays live when LOCAL_POSITION_NED is active without GLOBAL_POSITION_INT."""
+    from types import SimpleNamespace
+    from vps.mavlink.connection import MAVLinkBridge
+
+    bridge = MAVLinkBridge(mode="shadow")
+
+    class FakeMav:
+        def __init__(self, msgs):
+            self._msgs = list(msgs)
+
+        def recv_match(self, blocking=True, timeout=0.1):
+            if self._msgs:
+                return self._msgs.pop(0)
+            bridge._running = False
+            return None
+
+    class Msg:
+        def __init__(self, mtype, **kw):
+            self._t = mtype
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+        def get_type(self):
+            return self._t
+
+    bridge.mav = FakeMav([
+        Msg("LOCAL_POSITION_NED", x=1.0, y=2.0, z=-5.0, vx=0.5, vy=0.0, vz=0.0),
+        Msg("VFR_HUD", alt=540.0),
+        Msg("VFR_HUD", alt=546.5),
+    ])
+    bridge._running = True
+    bridge._recv_worker()
+
+    assert bridge._has_local_pos_ned is True
+    assert abs(bridge._latest_baro - 6.5) < 1e-6
+

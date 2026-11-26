@@ -96,6 +96,20 @@ class MapConfig:
     min_confidence: float = 0.25
 
 
+@dataclass
+class VTXConfig:
+    enabled: bool = False
+    sink: str = "auto"  # "auto", "fb", "window", "mjpeg", "fb+mjpeg"
+    fb_device: str = "/dev/fb0"
+    mjpeg_port: int = 8080
+    output_width: int = 720
+    output_height: int = 540
+    target_fps: float = 15.0
+    show_features: bool = True
+    max_drawn_features: int = 35
+    show_velocity_vector: bool = True
+
+
 class ConfigurationConflictError(ValueError):
     """Raised when safety invariants are violated in configuration."""
     pass
@@ -110,6 +124,7 @@ class VPSConfig:
     fusion: FusionConfig = field(default_factory=FusionConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     map: MapConfig = field(default_factory=MapConfig)
+    vtx: VTXConfig = field(default_factory=VTXConfig)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -148,6 +163,7 @@ class VPSConfig:
         fusion_data = data.get("fusion", {})
         logger_data = data.get("logger", {})
         map_data = data.get("map", {})
+        vtx_data = data.get("vtx", {})
 
         return cls(
             mode=mode,
@@ -157,6 +173,7 @@ class VPSConfig:
             fusion=FusionConfig(**fusion_data),
             logger=LoggerConfig(**logger_data),
             map=MapConfig(**map_data),
+            vtx=VTXConfig(**vtx_data),
         )
 
     def to_yaml(self, yaml_path: str | Path) -> None:
@@ -174,6 +191,7 @@ class VPSConfig:
             "fusion": self.fusion.__dict__,
             "logger": self.logger.__dict__,
             "map": self.map.__dict__,
+            "vtx": self.vtx.__dict__,
         }
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)

@@ -45,12 +45,14 @@ from vps.tracker.feature_tracker import FeatureTracker
 from vps.geometry.derotation import GyroDerotationEngine
 from vps.nav_ekf.es_ekf import ErrorStateEKF, ESEKFConfig, NavState
 from vps.vio.velocity_estimator import VIOVelocityEstimator
+from vps.map_db.geotiff_parser import GeoTIFFParser
 from vps.map_db.runtime_lookup import RuntimeMapDB
 from vps.map_matcher.orthorectifier import FrameOrthorectifier
 from vps.map_matcher.matcher import MapMatcher
 from vps.tools.aruco_validator import ArUcoValidator, ArUcoMarkerConfig
 from vps.tools.logger import TelemetryLogger, TelemetryRecord
 from vps.tools.session_recorder import ShadowSessionRecorder, ShadowTelemetryRecord
+from vps.tools.vtx_hud import VTXDisplayServer, VTXHudData
 from vps.health.watchdog import WatchdogSupervisor, ShadowSupervisor
 from vps.health.health_monitor import HealthMonitor
 
@@ -174,16 +176,31 @@ class VPSApplication:
         self._map_match_thread: Optional[threading.Thread] = None
         self._map_match_running = False
         self._map_match_lock = threading.Lock()
+        self._ekf_lock = threading.RLock()
         self._pending_map_job: Optional[Dict[str, Any]] = None
         self._last_map_match_time: float = 0.0
         self._last_map_match_status: str = "STANDBY"
         self._reset_counter: int = 0
+        self._map_geo_parser: Optional[GeoTIFFParser] = None
+        self._ekf_geo_aligned: bool = False
+        self._ekf_yaw_aligned: bool = False
+        self._map_origin_offset_ne: np.ndarray = np.zeros(2, dtype=np.float64)
+        self._last_map_diag: Dict[str, Any] = {
+            "attempted": False,
+            "accepted": False,
+            "lat_deg": 0.0,
+            "lon_deg": 0.0,
+            "error_m": 0.0,
+            "reason": "",
+        }
 
         if getattr(self.cfg, "map", None) and self.cfg.map.enabled:
             map_path = Path(self.cfg.map.db_path)
             if (map_path / "manifest.json").is_file():
                 try:
                     self.map_db = RuntimeMapDB(db_directory=map_path)
+                    h_lat, h_lon = self.map_db.home_origin_wgs84
+                    self._map_geo_parser = GeoTIFFParser(home_lat_deg=h_lat, home_lon_deg=h_lon)
                     self.orthorectifier = FrameOrthorectifier(camera_config=self.cfg.camera)
                     self.map_matcher = MapMatcher(
                         min_inliers_feature=self.cfg.map.min_inliers,
@@ -194,10 +211,17 @@ class VPSApplication:
             else:
                 logger.info("No Map DB found at %s. Operating in VIO-only dead-reckoning mode.", map_path)
 
+        # 10. Optional Minimalist VTX OSD Video Feed
+        self.vtx_hud: Optional[VTXDisplayServer] = (
+            VTXDisplayServer(self.cfg.vtx) if self.cfg.vtx.enabled else None
+        )
+
     def start(self) -> bool:
         """Start hardware devices, telemetry streams, and background workers."""
         if self.phase1_only:
             logger.info("Starting Visual Positioning System in PHASE 1 SHADOW MODE...")
+        elif self.cfg.mode == "shadow":
+            logger.info("Starting Visual Positioning System in PHASE 2 SHADOW MODE (Observe-Only VIO + Map Matching)...")
         else:
             logger.info("Starting Visual Positioning System (Phase 1 + Phase 2)...")
         logger.info("Camera: %s (%dx%d @ %d fps)", self.cfg.camera.name, self.cfg.camera.width, self.cfg.camera.height, self.cfg.camera.fps)
@@ -229,6 +253,11 @@ class VPSApplication:
         # Start Map Matcher Background Thread (Phase 2 only)
         if not self.phase1_only:
             self._start_map_worker()
+
+        # Start VTX OSD Output Server if enabled
+        if self.vtx_hud is not None:
+            self.vtx_hud.start()
+            logger.info("VTX OSD interface enabled (sink=%s, %dx%d)", self.cfg.vtx.sink, self.cfg.vtx.output_width, self.cfg.vtx.output_height)
 
         self._running = True
         return True
@@ -264,6 +293,7 @@ class VPSApplication:
             rpy = job["attitude_rpy_rad"]
             height_agl_m = job["height_agl_m"]
             pos_prior_ned = job["pos_prior_ned"]
+            map_offset_ne = job["map_offset_ne"]
 
             try:
                 # 1. Orthorectify live frame to nadir North-up image matching map GSD
@@ -276,51 +306,104 @@ class VPSApplication:
                 )
                 if not ortho.is_valid:
                     self._last_map_match_status = f"ORTHO_INVALID: {ortho.status_message}"
+                    with self._map_match_lock:
+                        self._last_map_diag = {
+                            "attempted": False,
+                            "accepted": False,
+                            "lat_deg": 0.0,
+                            "lon_deg": 0.0,
+                            "error_m": 0.0,
+                            "reason": self._last_map_match_status,
+                        }
                     continue
 
-                # 2. Query spatial candidate tiles from runtime DB
+                # 2. Query spatial candidate tiles from runtime DB (in Map DB NED)
+                pos_prior_map_ne = pos_prior_ned[:2] + map_offset_ne
                 candidate_tiles = self.map_db.query_tiles(
-                    pos_ned_m=pos_prior_ned[:2],
+                    pos_ned_m=pos_prior_map_ne,
                     search_radius_m=self.cfg.map.search_radius_m,
                     max_tiles_return=4,
                 )
                 if not candidate_tiles:
                     self._last_map_match_status = "NO_TILES_IN_SEARCH_WINDOW"
+                    with self._map_match_lock:
+                        self._last_map_diag = {
+                            "attempted": False,
+                            "accepted": False,
+                            "lat_deg": 0.0,
+                            "lon_deg": 0.0,
+                            "error_m": 0.0,
+                            "reason": "NO_TILES_IN_SEARCH_WINDOW",
+                        }
                     continue
 
                 # 3. Match frame against reference tiles
                 match_res = self.map_matcher.match_frame_to_map(
                     ortho=ortho,
                     candidate_tiles=candidate_tiles,
-                    pos_prior_ned_m=pos_prior_ned[:2],
+                    pos_prior_ned_m=pos_prior_map_ne,
                     search_radius_m=self.cfg.map.search_radius_m,
                     timestamp_s=timestamp_s,
                 )
 
-                if match_res.is_valid and match_res.confidence >= self.cfg.map.min_confidence:
-                    # 4. Inject delayed-state correction into ES-EKF
-                    fused = self.ekf.update_map_match_delayed(
-                        fix_ned_m=match_res.pos_ned_m,
-                        cov_ned_m2=match_res.cov_ned_m2,
-                        timestamp_s=timestamp_s,
-                        confidence=match_res.confidence,
+                m_lat, m_lon = 0.0, 0.0
+                err_m = float(np.linalg.norm(match_res.pos_ned_m - pos_prior_map_ne)) if match_res.is_valid else 0.0
+                if match_res.is_valid and self._map_geo_parser is not None:
+                    m_lat, m_lon = self._map_geo_parser.local_ned_to_wgs84(
+                        float(match_res.pos_ned_m[0]),
+                        float(match_res.pos_ned_m[1]),
                     )
-                    if fused:
-                        self._reset_counter += 1
+
+                if match_res.is_valid and match_res.confidence >= self.cfg.map.min_confidence:
+                    # 4. Convert Map DB fix back into EKF Local NED frame and inject delayed-state update
+                    fix_ekf_ne = match_res.pos_ned_m - map_offset_ne
+                    with self._ekf_lock:
+                        fused = self.ekf.update_map_match_delayed(
+                            fix_ned_m=fix_ekf_ne,
+                            cov_ned_m2=match_res.cov_ned_m2,
+                            timestamp_s=timestamp_s,
+                            confidence=match_res.confidence,
+                        )
+                        if fused:
+                            self._reset_counter += 1
                     self._last_map_match_status = (
                         f"MATCHED({match_res.match_method}, inliers={match_res.num_inliers}, "
                         f"conf={match_res.confidence:.2f}, fused={fused})"
                     )
+                    reason = f"{match_res.match_method}:inliers={match_res.num_inliers}:fused={fused}"
+                    accepted = bool(fused)
                 else:
-                    self._last_map_match_status = f"MATCH_FAILED: {match_res.status_message or 'low confidence'}"
+                    reason = match_res.status_message or "low confidence"
+                    self._last_map_match_status = f"MATCH_FAILED: {reason}"
+                    accepted = False
+
+                with self._map_match_lock:
+                    self._last_map_diag = {
+                        "attempted": True,
+                        "accepted": accepted,
+                        "lat_deg": float(m_lat),
+                        "lon_deg": float(m_lon),
+                        "error_m": float(err_m),
+                        "reason": str(reason)[:64],
+                    }
             except Exception as e:
                 self._last_map_match_status = f"ERROR: {e}"
+                with self._map_match_lock:
+                    self._last_map_diag = {
+                        "attempted": False,
+                        "accepted": False,
+                        "lat_deg": 0.0,
+                        "lon_deg": 0.0,
+                        "error_m": 0.0,
+                        "reason": str(e)[:64],
+                    }
 
     def run_autonomous_flight(self) -> None:
         """Main autonomous vision-in-the-loop processing loop (Phase 1 + Phase 2)."""
         frame_idx = 0
         t_last_log = time.monotonic()
         fps_counter = 0
+        last_fps = 0.0
 
         if self.phase1_only:
             logger.info("Entering Phase 1 autonomous height estimation loop (SHADOW MODE)...")
@@ -340,6 +423,7 @@ class VPSApplication:
 
             # 1. Interpolate synchronized telemetry matching frame exposure midpoint
             telem = self.ring_buffer.interpolate(t_capture)
+            has_live_telem = telem is not None
             if telem is not None:
                 self.watchdog.record_telemetry()
             else:
@@ -366,20 +450,59 @@ class VPSApplication:
             )
 
             h_agl = max(self.cfg.camera.baseline_ground_offset_m, fusion_out.height_agl_m)
+            vio_conf = float(fusion_out.confidence)
+            vio_inliers = 0
+            vio_flow_px = 0.0
+
+            need_fc_status = (
+                (not self.phase1_only and not self._ekf_geo_aligned and self._map_geo_parser is not None)
+                or (self.session_logger is not None and isinstance(self.session_logger, ShadowSessionRecorder))
+                or (self.vtx_hud is not None)
+            )
+            fc_status: Optional[Dict[str, Any]] = self.mavlink_bridge.get_fc_status() if need_fc_status else None
 
             if not self.phase1_only:
-                # 2. ES-EKF High-Rate IMU Propagation
-                self.ekf.predict_imu(
-                    accel_meas_mps2=telem.accel_mps2,
-                    gyro_meas_rad_s=telem.gyro_rad_s,
-                    timestamp_s=t_capture,
-                )
+                if not self._ekf_geo_aligned and self._map_geo_parser is not None and fc_status is not None:
+                    gps_fix = int(fc_status.get("gps_fix_type", 0))
+                    gps_lat = float(fc_status.get("gps_lat_deg", 0.0))
+                    gps_lon = float(fc_status.get("gps_lon_deg", 0.0))
+                    if gps_fix >= 3 and (abs(gps_lat) > 1e-5 or abs(gps_lon) > 1e-5):
+                        n_off, e_off = self._map_geo_parser.wgs84_to_local_ned(gps_lat, gps_lon)
+                        if float(np.hypot(n_off, e_off)) <= 5000.0:
+                            # Preserve FC Local NED frame inside EKF while recording offset to Map DB NED
+                            self._map_origin_offset_ne = np.array(
+                                [n_off - float(telem.pos_ned_m[0]), e_off - float(telem.pos_ned_m[1])],
+                                dtype=np.float64,
+                            )
+                            self._ekf_geo_aligned = True
+                            logger.info(
+                                "Aligned Map DB offset: N=%.2fm, E=%.2fm (GPS %.6f, %.6f)",
+                                self._map_origin_offset_ne[0], self._map_origin_offset_ne[1], gps_lat, gps_lon,
+                            )
 
-                # 3. ES-EKF Compass Heading Update
-                self.ekf.update_compass_yaw(yaw_compass_rad=float(telem.attitude_rpy_rad[2]))
+                with self._ekf_lock:
+                    # Align EKF attitude and altitude before pushing first live history snapshot
+                    if has_live_telem and not self._ekf_yaw_aligned:
+                        self.ekf.align_attitude(
+                            roll_rad=float(telem.attitude_rpy_rad[0]),
+                            pitch_rad=float(telem.attitude_rpy_rad[1]),
+                            yaw_rad=float(telem.attitude_rpy_rad[2]),
+                        )
+                        self.ekf.update_height(height_agl_m=h_agl, bypass_gate=True)
+                        self._ekf_yaw_aligned = True
 
-                # 5. ES-EKF Vertical Position Update (Height AGL)
-                self.ekf.update_height(height_agl_m=h_agl)
+                    # 2. ES-EKF High-Rate IMU Propagation
+                    self.ekf.predict_imu(
+                        accel_meas_mps2=telem.accel_mps2,
+                        gyro_meas_rad_s=telem.gyro_rad_s,
+                        timestamp_s=t_capture,
+                    )
+
+                    # 3. ES-EKF Compass Heading Update
+                    self.ekf.update_compass_yaw(yaw_compass_rad=float(telem.attitude_rpy_rad[2]))
+
+                    # 5. ES-EKF Vertical Position Update (Height AGL)
+                    self.ekf.update_height(height_agl_m=h_agl)
 
                 # 6. Phase 2: Frame-to-Frame Metric VIO Velocity Estimation
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
@@ -388,10 +511,13 @@ class VPSApplication:
                     dt_vio = t_capture - (self._prev_vio_time if self._prev_vio_time is not None else (t_capture - 1.0 / 30.0))
                     if dt_vio > 0.001:
                         track_res = self.vio_tracker.track(self._prev_vio_gray, gray, self._prev_vio_pts)
+                        vio_inliers = int(track_res.num_inliers)
+                        vio_flow_px = float(track_res.median_flow_px)
                         if track_res.num_inliers >= 8 and self._prev_vio_att is not None:
-                            delta_rpy = telem.attitude_rpy_rad - self._prev_vio_att
-                            R_rel = self.vio_derot.rotation_matrix_from_rpy_delta(delta_rpy[0], delta_rpy[1], delta_rpy[2])
-                            H_derot = self.vio_derot.compute_rotational_homography(R_rel)
+                            R_w_b0 = self.vio_est.euler_to_R_wb(*self._prev_vio_att)
+                            R_w_b1 = self.vio_est.euler_to_R_wb(*telem.attitude_rpy_rad)
+                            R_cam_rel = self.vio_est.R_b2c @ (R_w_b1.T @ R_w_b0) @ self.vio_est.R_c2b
+                            H_derot = self.vio_derot.compute_rotational_homography(R_cam_rel)
 
                             try:
                                 vio_res = self.vio_est.estimate_velocity_from_flow(
@@ -405,11 +531,13 @@ class VPSApplication:
                                     timestamp_s=t_capture,
                                     compute_homography_alternative=False,
                                 )
+                                vio_conf = float(vio_res.confidence)
                                 if vio_res.confidence > 0.2:
-                                    self.ekf.update_vio_velocity(
-                                        vel_ned_mps=vio_res.vel_ned_mps,
-                                        confidence=vio_res.confidence,
-                                    )
+                                    with self._ekf_lock:
+                                        self.ekf.update_vio_velocity(
+                                            vel_vio_ned_mps=vio_res.vel_ned_mps,
+                                            confidence=vio_res.confidence,
+                                        )
                             except Exception as e:
                                 logger.debug("VIO estimation skipped: %s", e)
 
@@ -421,6 +549,9 @@ class VPSApplication:
 
                 # 7. Asynchronous Map Matcher Job Queue (1-2 Hz)
                 if self.map_db is not None and (t_capture - self._last_map_match_time) >= (1.0 / self.cfg.map.match_rate_hz):
+                    with self._ekf_lock:
+                        pos_prior_copy = self.ekf.state.pos_ned_m.copy()
+                        reset_cnt_copy = self._reset_counter
                     with self._map_match_lock:
                         if self._pending_map_job is None:
                             self._pending_map_job = {
@@ -428,25 +559,42 @@ class VPSApplication:
                                 "timestamp_s": t_capture,
                                 "attitude_rpy_rad": telem.attitude_rpy_rad.copy(),
                                 "height_agl_m": h_agl,
-                                "pos_prior_ned": self.ekf.state.pos_ned_m.copy(),
+                                "pos_prior_ned": pos_prior_copy,
+                                "map_offset_ne": self._map_origin_offset_ne.copy(),
                             }
                             self._last_map_match_time = t_capture
+                else:
+                    with self._ekf_lock:
+                        reset_cnt_copy = self._reset_counter
 
                 # 9. MAVLink Output 2: ODOMETRY / VISION_POSITION_ESTIMATE (Phase 2)
-                if self.mavlink_bridge.odometry_sender:
-                    self.mavlink_bridge.odometry_sender.update_from_ekf(
-                        nav_state=self.ekf.state,
-                        P_15x15=self.ekf.P,
-                        confidence=fusion_out.confidence,
-                        frame_timestamp_s=t_capture,
-                        gyro_rad_s=telem.gyro_rad_s,
-                        reset_counter=self._reset_counter,
-                    )
+                if self.mavlink_bridge.odometry_sender and self.cfg.mode != "shadow":
+                    with self._ekf_lock:
+                        self.mavlink_bridge.odometry_sender.update_from_ekf(
+                            nav_state=self.ekf.state,
+                            P_15x15=self.ekf.P,
+                            confidence=fusion_out.confidence,
+                            frame_timestamp_s=t_capture,
+                            gyro_rad_s=telem.gyro_rad_s,
+                            reset_counter=reset_cnt_copy,
+                        )
+
+            if not self.phase1_only:
+                with self._ekf_lock:
+                    ekf_pos = self.ekf.state.pos_ned_m.copy()
+                    ekf_vel = self.ekf.state.vel_ned_mps.copy()
+                    ekf_pos_std = float(np.sqrt(max(0.0, 0.5 * (self.ekf.P[0, 0] + self.ekf.P[1, 1]))))
+                    ekf_vel_std = float(np.sqrt(max(0.0, 0.5 * (self.ekf.P[3, 3] + self.ekf.P[4, 4]))))
+            else:
+                ekf_pos = np.zeros(3, dtype=np.float64)
+                ekf_vel = np.zeros(3, dtype=np.float64)
+                ekf_pos_std = 0.0
+                ekf_vel_std = 0.0
 
             # Record session log if active
             if self.session_logger is not None:
                 if isinstance(self.session_logger, ShadowSessionRecorder):
-                    fc_status = self.mavlink_bridge.get_fc_status()
+                    assert fc_status is not None
                     shadow_rec = ShadowTelemetryRecord(
                         timestamp_s=t_capture,
                         fc_boot_ms=int(fc_status["fc_boot_ms"]),
@@ -491,12 +639,27 @@ class VPSApplication:
                         optical_flow_mean_px=float(fusion_out.median_flow_px),
                     )
                     if not self.phase1_only:
-                        shadow_rec.vps_pos_n_m = float(self.ekf.state.pos_ned_m[0])
-                        shadow_rec.vps_pos_e_m = float(self.ekf.state.pos_ned_m[1])
-                        shadow_rec.vps_pos_d_m = float(self.ekf.state.pos_ned_m[2])
-                        shadow_rec.vps_vel_n_mps = float(self.ekf.state.vel_ned_mps[0])
-                        shadow_rec.vps_vel_e_mps = float(self.ekf.state.vel_ned_mps[1])
-                        shadow_rec.vps_vel_d_mps = float(self.ekf.state.vel_ned_mps[2])
+                        shadow_rec.vps_pos_n_m = float(ekf_pos[0])
+                        shadow_rec.vps_pos_e_m = float(ekf_pos[1])
+                        shadow_rec.vps_pos_d_m = float(ekf_pos[2])
+                        shadow_rec.vps_pos_std_m = ekf_pos_std
+                        shadow_rec.vps_vel_n_mps = float(ekf_vel[0])
+                        shadow_rec.vps_vel_e_mps = float(ekf_vel[1])
+                        shadow_rec.vps_vel_d_mps = float(ekf_vel[2])
+                        shadow_rec.vps_vel_std_mps = ekf_vel_std
+                        shadow_rec.vps_nav_confidence = float(vio_conf)
+                        if vio_inliers > 0:
+                            shadow_rec.features_tracked = vio_inliers
+                            shadow_rec.inlier_count = vio_inliers
+                            shadow_rec.optical_flow_mean_px = vio_flow_px
+                        with self._map_match_lock:
+                            map_diag = dict(self._last_map_diag)
+                        shadow_rec.map_match_attempted = bool(map_diag["attempted"])
+                        shadow_rec.map_match_accepted = bool(map_diag["accepted"])
+                        shadow_rec.map_match_lat_deg = float(map_diag["lat_deg"])
+                        shadow_rec.map_match_lon_deg = float(map_diag["lon_deg"])
+                        shadow_rec.map_match_error_m = float(map_diag["error_m"])
+                        shadow_rec.map_match_reason = str(map_diag["reason"])
                     self.session_logger.log_record_and_frame(
                         shadow_rec,
                         frame if self.save_images else None,
@@ -523,7 +686,7 @@ class VPSApplication:
 
             # 8. MAVLink Output 1: DISTANCE_SENSOR (Phase 1)
             # Sends passive distance sensor packet for pilot display in Mission Planner HUD
-            if self.mavlink_bridge.distance_sender:
+            if self.mavlink_bridge.distance_sender and self.cfg.mode != "shadow":
                 self.mavlink_bridge.distance_sender.update_measurement(
                     height_agl_m=fusion_out.height_agl_m,
                     confidence=fusion_out.confidence,
@@ -536,11 +699,15 @@ class VPSApplication:
                 self.mavlink_bridge.send_heartbeat()
                 self.mavlink_bridge.send_named_value_float("VPS_H", float(fusion_out.height_agl_m))
                 self.mavlink_bridge.send_named_value_float("VPS_CONF", float(fusion_out.confidence))
+                if not self.phase1_only:
+                    self.mavlink_bridge.send_named_value_float("VPS_PN", float(ekf_pos[0]))
+                    self.mavlink_bridge.send_named_value_float("VPS_PE", float(ekf_pos[1]))
 
-            # 10. Periodic Status Logging (1 Hz)
+            # 10. Periodic Status Logging (1 Hz) & Non-blocking VTX OSD submission
             t_now = time.monotonic()
             if t_now - t_last_log >= 1.0:
-                fps = fps_counter / (t_now - t_last_log)
+                last_fps = fps_counter / (t_now - t_last_log)
+                fps = last_fps
                 fps_counter = 0
                 t_last_log = t_now
 
@@ -556,22 +723,42 @@ class VPSApplication:
                         fps,
                     )
                 else:
-                    pos_n = self.ekf.state.pos_ned_m[0]
-                    pos_e = self.ekf.state.pos_ned_m[1]
-                    vel_n = self.ekf.state.vel_ned_mps[0]
-                    vel_e = self.ekf.state.vel_ned_mps[1]
-
                     logger.info(
                         "AGL: %5.2fm | Pos: [%6.1f, %6.1f]m | Vel: [%5.1f, %5.1f]m/s | Map: %-22s | Conf: %.2f | Rate: %4.1f fps",
                         fusion_out.height_agl_m,
-                        pos_n,
-                        pos_e,
-                        vel_n,
-                        vel_e,
+                        ekf_pos[0],
+                        ekf_pos[1],
+                        ekf_vel[0],
+                        ekf_vel[1],
                         self._last_map_match_status[:22],
                         fusion_out.confidence,
                         fps,
                     )
+
+            # 11. Submit latest frame to non-blocking VTX OSD worker
+            if self.vtx_hud is not None:
+                fc_info = fc_status or {}
+                hud_data = VTXHudData(
+                    height_agl_m=float(fusion_out.height_agl_m),
+                    baro_alt_m=float(telem.baro_alt_m),
+                    confidence=float(fusion_out.confidence),
+                    mode_status=fusion_out.mode_status,
+                    is_armed=bool(fc_info.get("is_armed", False)),
+                    flight_mode=str(fc_info.get("flight_mode", "UNKNOWN")),
+                    battery_voltage_v=float(fc_info.get("battery_voltage_v", 0.0)),
+                    gps_satellites=int(fc_info.get("gps_satellites", 0)),
+                    fps=float(last_fps),
+                    num_inliers=int(fusion_out.num_inliers),
+                    pos_n_m=float(ekf_pos[0]),
+                    pos_e_m=float(ekf_pos[1]),
+                    vel_n_mps=float(ekf_vel[0]),
+                    vel_e_mps=float(ekf_vel[1]),
+                    map_status=self._last_map_match_status,
+                    phase1_only=self.phase1_only,
+                    is_shadow=(self.cfg.mode == "shadow"),
+                    tracked_points=fusion_out.tracked_points,
+                )
+                self.vtx_hud.submit(frame, hud_data)
 
     def run_handheld_testing(self) -> None:
         """Interactive hand-held testing mode with live ArUco & optical flow HUD."""
@@ -653,6 +840,9 @@ class VPSApplication:
             self.session_logger.close()
             logger.info("Session telemetry log saved to: %s", self.session_logger.csv_path)
             self.session_logger = None
+        if self.vtx_hud is not None:
+            self.vtx_hud.stop()
+            self.vtx_hud = None
         self.watchdog.stop()
         self.camera.stop()
         self.mavlink_bridge.stop()
@@ -673,11 +863,28 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--map-db", type=str, default=None, help="Path to offline tiled GeoTIFF map database")
     parser.add_argument("--no-map", action="store_true", help="Disable absolute map matching (run in VIO dead-reckoning mode)")
     parser.add_argument("--feed-ekf", action="store_true", help="Enable active control feeding into ArduPilot FC EKF")
-    parser.add_argument("--shadow", action="store_true", help="Run Phase 1 in Shadow Mode: logs telemetry + estimates to CSV, disables FC feeding, skips Phase 2")
+    parser.add_argument("--shadow", action="store_true", help="Run Phase 1 + Phase 2 (VIO + Map Matching) in strictly observe-only Shadow Mode")
+    parser.add_argument("--shadow-p2", action="store_true", help="Alias for --shadow (Phase 1 + Phase 2 observe-only Shadow Mode)")
     parser.add_argument("--phase1-only", action="store_true", help="Run exclusively Phase 1 (Vision-based AGL height estimation)")
     parser.add_argument("--record", action="store_true", help="Record synchronized telemetry and height estimates to a CSV session log")
     parser.add_argument("--save-images", action="store_true", help="Save captured camera frames to disk alongside CSV telemetry")
+    parser.add_argument("--vtx", action="store_true", help="Enable minimalist VTX OSD video feed output")
+    parser.add_argument(
+        "--vtx-sink",
+        choices=["auto", "fb", "window", "mjpeg", "fb+mjpeg"],
+        default=None,
+        help="VTX video output backend (fb=/dev/fb0 analog/HDMI, mjpeg=HTTP stream, window=desktop)",
+    )
+    parser.add_argument("--vtx-port", type=int, default=None, help="HTTP port for MJPEG VTX preview stream (default 8080)")
     return parser.parse_args()
+
+
+def _resolve_operational_flags(args: argparse.Namespace) -> tuple[bool, bool, bool]:
+    """Resolve (is_shadow, phase1_only, record_session) from CLI arguments."""
+    is_shadow = bool(args.shadow or args.shadow_p2)
+    phase1_only = bool(args.phase1_only)
+    record_session = bool(args.record or is_shadow)
+    return is_shadow, phase1_only, record_session
 
 
 def main() -> int:
@@ -701,10 +908,15 @@ def main() -> int:
         cfg.map.enabled = False
     if args.feed_ekf:
         cfg.mavlink.feed_fc_ekf = True
+    if args.vtx:
+        cfg.vtx.enabled = True
+    if args.vtx_sink is not None:
+        cfg.vtx.enabled = True
+        cfg.vtx.sink = args.vtx_sink
+    if args.vtx_port is not None:
+        cfg.vtx.mjpeg_port = int(args.vtx_port)
 
-    is_shadow = bool(args.shadow)
-    phase1_only = bool(args.phase1_only or is_shadow)
-    record_session = bool(args.record or is_shadow)
+    is_shadow, phase1_only, record_session = _resolve_operational_flags(args)
 
     if is_shadow:
         cfg.mode = "shadow"

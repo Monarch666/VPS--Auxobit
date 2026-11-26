@@ -264,13 +264,10 @@ class TestE2EIntegration:
                 if dt_s > 0.001:
                     track_res = tracker.track(prev_gray, gray, prev_pts)
                     if track_res.num_inliers >= 8:
-                        H_derot = derot.compute_rotational_homography(
-                            derot.rotation_matrix_from_rpy_delta(
-                                att[0] - prev_att[0],
-                                att[1] - prev_att[1],
-                                att[2] - prev_att[2],
-                            )
-                        )
+                        R_wb0 = vio_est.euler_to_R_wb(*prev_att)
+                        R_wb1 = vio_est.euler_to_R_wb(*att)
+                        R_cam_rel = vio_est.R_b2c @ (R_wb1.T @ R_wb0) @ vio_est.R_c2b
+                        H_derot = derot.compute_rotational_homography(R_cam_rel)
                         vio_res = vio_est.estimate_velocity_from_flow(
                             pts0=track_res.pts_prev,
                             pts1=track_res.pts_curr,
@@ -737,6 +734,203 @@ class TestE2EIntegration:
         assert len(lines) >= 2, f"CSV should contain at least header and 1 record, got {len(lines)}"
         assert "estimated_h_m" in lines[0]
         assert "baro_alt_m" in lines[0]
+
+    def test_shadow_p2_full_application_vio_map_match_and_vtx_e2e(self, tmp_path):
+        """Full E2E: VPSApplication in Shadow-P2 executes VIO, heading alignment, MapDB match, VTX HUD, and logging."""
+        import csv
+        import threading
+        import tifffile
+        from vps.main import VPSApplication
+        from vps.map_db.geotiff_parser import GeoTIFFParser
+        from vps.map_db.tiler import MapTiler
+        from vps.tools.evaluate import ShadowEvaluator
+
+        # 1. Build deterministic high-res textured GeoTIFF & MapDB in tmp_path
+        home_lat, home_lon = 19.80955, 75.28280
+        width_px, height_px = 1024, 1024
+        gsd_m = 0.5
+        dlon_px = gsd_m / (111412.84 * np.cos(np.radians(home_lat)))
+        dlat_px = gsd_m / 111132.954
+        top_lat = home_lat + (height_px / 2.0) * dlat_px
+        left_lon = home_lon - (width_px / 2.0) * dlon_px
+
+        rng = np.random.default_rng(77)
+        noise_low = rng.integers(45, 115, size=(height_px // 4, width_px // 4, 3), dtype=np.uint8)
+        sat_bgr = cv2.resize(noise_low, (width_px, height_px), interpolation=cv2.INTER_CUBIC)
+        for _ in range(220):
+            x0, y0 = int(rng.integers(20, width_px - 80)), int(rng.integers(20, height_px - 80))
+            w, h = int(rng.integers(15, 70)), int(rng.integers(15, 70))
+            col = tuple(int(c) for c in rng.integers(120, 250, size=3))
+            cv2.rectangle(sat_bgr, (x0, y0), (x0 + w, y0 + h), col, -1)
+            cv2.circle(sat_bgr, (x0 + w // 2, y0 + h // 2), max(4, min(w, h) // 3), (255, 240, 210), 2)
+
+        tif_path = tmp_path / "site.tif"
+        extratags = [
+            (33550, "d", 3, (dlon_px, dlat_px, 0.0), True),
+            (33922, "d", 6, (0.0, 0.0, 0.0, left_lon, top_lat, 0.0), True),
+            (34735, "H", 16, (1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326), True),
+        ]
+        tifffile.imwrite(str(tif_path), cv2.cvtColor(sat_bgr, cv2.COLOR_BGR2RGB), photometric="rgb", extratags=extratags)
+
+        db_dir = tmp_path / "map_db"
+        MapTiler(tile_size_px=512, overlap_ratio=0.15).build_database(
+            geotiff_path=tif_path,
+            output_dir=db_dir,
+            map_name="test_site",
+            home_origin_deg=(home_lat, home_lon),
+        )
+
+        # 2. Configure Shadow-P2 VPSApplication (with MapDB + VTX HUD + SessionRecorder)
+        cfg = VPSConfig(mode="shadow")
+        cfg.camera.device_index = "mock"
+        cfg.mavlink.connection_string = "udpin:127.0.0.1:19996"
+        cfg.mavlink.feed_fc_ekf = False
+        cfg.logger.output_dir = str(tmp_path / "logs")
+        cfg.map.enabled = True
+        cfg.map.db_path = str(db_dir)
+        cfg.map.match_rate_hz = 4.0
+        cfg.map.min_inliers = 8
+        cfg.map.min_confidence = 0.2
+        cfg.vtx.enabled = True
+        cfg.vtx.sink = "auto"
+
+        app = VPSApplication(
+            config=cfg,
+            phase1_only=False,
+            record_session=True,
+            save_images=False,
+        )
+
+        # Flight trajectory: Drone starts (+35m N, -25m E) from MapDB center, heading 135 deg SE (>67 deg test)
+        map_off_n, map_off_e = 35.0, -25.0
+        parser = GeoTIFFParser(home_lat, home_lon)
+        takeoff_lat, takeoff_lon = parser.local_ned_to_wgs84(map_off_n, map_off_e)
+        yaw_se = float(np.radians(135.0))
+        vel_n, vel_e, h_agl = 6.0, -4.0, 55.0
+
+        # Precompute projection helper from sat_bgr to nadir/tilted camera frames
+        gmeta = GeoTIFFParser.extract_metadata(tif_path)
+        r_earth = GeoTIFFParser.WGS84_A
+
+        class SyntheticGeoCamera:
+            def __init__(self):
+                self.idx = 0
+                self.t0 = time.monotonic()
+
+            def start(self):
+                return True
+
+            def stop(self):
+                pass
+
+            def read_frame(self):
+                if self.idx >= 24:
+                    time.sleep(0.01)
+                    return False, None, time.monotonic()
+                dt = 1.0 / 30.0
+                t = self.t0 + self.idx * dt
+                rel_n = vel_n * (self.idx * dt)
+                rel_e = vel_e * (self.idx * dt)
+                roll = 0.03 * np.sin(self.idx * 0.2)
+                pitch = -0.02 * np.cos(self.idx * 0.2)
+                att = np.array([roll, pitch, yaw_se], dtype=np.float64)
+
+                # Feed matching FC telemetry into ring buffer
+                app.ring_buffer.add_sample(
+                    TelemetrySample(
+                        timestamp_s=t,
+                        gyro_rad_s=np.zeros(3),
+                        attitude_rpy_rad=att,
+                        vel_ned_mps=np.array([vel_n, vel_e, 0.0]),
+                        baro_alt_m=h_agl,
+                        pos_ned_m=np.array([rel_n, rel_e, -h_agl]),
+                        accel_mps2=np.array([0.0, 0.0, -9.80665]),
+                    )
+                )
+
+                # Render exact camera view over sat_bgr at (map_off + rel)
+                R_wb = app.orthorectifier.euler_to_R_wb(*att)
+                R_cw = app.vio_est.R_b2c @ R_wb.T
+                t_c = R_cw @ np.array([0.0, 0.0, h_agl])
+                H_cam2g = np.linalg.inv(cfg.camera.K @ np.column_stack([R_cw[:, 0], R_cw[:, 1], t_c]))
+                u_c, v_c = np.meshgrid(
+                    np.arange(cfg.camera.width, dtype=np.float32),
+                    np.arange(cfg.camera.height, dtype=np.float32),
+                )
+                pts_h = np.stack([u_c, v_c, np.ones_like(u_c)], axis=-1).reshape(-1, 3)
+                g_h = (H_cam2g @ pts_h.T).T
+                g_rel = g_h[:, :2] / g_h[:, 2:3]
+                g_n = map_off_n + rel_n + g_rel[:, 0]
+                g_e = map_off_e + rel_e + g_rel[:, 1]
+                lat_d = np.degrees(np.radians(home_lat) + g_n / r_earth)
+                lon_d = np.degrees(np.radians(home_lon) + g_e / (r_earth * np.cos(np.radians(home_lat))))
+                px_s = ((lon_d - gmeta.georef.origin_lon_deg) / gmeta.georef.dlon_deg_per_px).astype(np.float32).reshape(cfg.camera.height, cfg.camera.width)
+                py_s = ((gmeta.georef.origin_lat_deg - lat_d) / gmeta.georef.dlat_deg_per_px).astype(np.float32).reshape(cfg.camera.height, cfg.camera.width)
+                frame = cv2.remap(sat_bgr, px_s, py_s, cv2.INTER_LINEAR)
+                self.idx += 1
+                time.sleep(0.015)
+                return True, frame, t
+
+        app.camera = SyntheticGeoCamera()
+        app.mavlink_bridge.get_fc_status = lambda: {
+            "heartbeat_seen": True,
+            "is_armed": True,
+            "flight_mode": "LOITER",
+            "battery_voltage_v": 16.0,
+            "gps_fix_type": 3,
+            "gps_lat_deg": takeoff_lat,
+            "gps_lon_deg": takeoff_lon,
+            "gps_alt_m": 550.0,
+            "gps_eph_m": 0.8,
+            "gps_epv_m": 1.2,
+            "gps_satellites": 12,
+            "rangefinder_dist_m": -1.0,
+            "fc_boot_ms": 1000,
+        }
+        # Pre-seed fusion filter at cruise height for fast test convergence
+        app.fusion_engine.filter.x[0] = h_agl
+
+        assert app.start()
+        worker = threading.Thread(target=app.run_autonomous_flight, daemon=True)
+        worker.start()
+
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            if app.camera.idx >= 24 and app._reset_counter >= 1:
+                break
+            time.sleep(0.05)
+
+        csv_path = app.session_logger.csv_path
+        app.stop()
+        worker.join(timeout=2.0)
+
+        # Assertions verifying every bug fix end-to-end
+        assert app._ekf_geo_aligned is True
+        assert np.allclose(app._map_origin_offset_ne, [map_off_n, map_off_e], atol=0.5)
+        assert app._ekf_yaw_aligned is True
+        est_yaw = float(app.ekf.state.roll_pitch_yaw_rad[2])
+        yaw_diff = abs((est_yaw - yaw_se + np.pi) % (2 * np.pi) - np.pi)
+        assert yaw_diff < np.radians(10.0), f"Heading did not align to 135deg SE: {np.degrees(est_yaw):.1f}"
+
+        # VIO velocity must track [6.0, -4.0] rather than staying 0
+        assert abs(app.ekf.state.vel_ned_mps[0] - vel_n) < 2.5
+        assert abs(app.ekf.state.vel_ned_mps[1] - vel_e) < 2.5
+
+        # Map matching worker must have fused >= 1 fix into EKF
+        assert app._reset_counter >= 1, f"Map match failed: {app._last_map_match_status}"
+
+        # Verify Shadow CSV logged Phase 2 + map diagnostics cleanly
+        with open(csv_path, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) >= 20
+        assert any(r["map_match_accepted"] == "True" for r in rows)
+
+        evaluator = ShadowEvaluator(session_dir=csv_path.parent, max_height_rel_err_tol_pct=15.0, max_p2_cep95_tol_m=10.0)
+        p1 = evaluator.evaluate_phase1()
+        p2 = evaluator.evaluate_phase2()
+        assert p1.pass_status is True
+        assert p2.cep_95_m < 8.0
+        assert p2.map_match_accepted >= 1
 
 
 if __name__ == "__main__":

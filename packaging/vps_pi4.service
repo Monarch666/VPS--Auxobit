@@ -1,0 +1,30 @@
+[Unit]
+Description=Visual Positioning System (VPS) Autonomous Companion Service
+After=multi-user.target local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+User=admin
+Group=dialout
+SupplementaryGroups=video render
+WorkingDirectory=/home/admin/VPS
+Environment=PYTHONPATH=/home/admin/VPS
+Environment=PYTHONUNBUFFERED=1
+
+# Wait up to 15s on cold drone boot for Flight Controller USB (/dev/ttyACM0) to enumerate
+ExecStartPre=/bin/bash -c 'mkdir -p /home/admin/VPS/logs && for i in $(seq 1 15); do [ -e /dev/ttyACM0 ] && break; sleep 1; done'
+
+ExecStart=/home/admin/VPS/venv/bin/python -m vps.main --config /home/admin/VPS/config/pi4_imx296.yaml --map-db /home/admin/VPS/data/map_db/aurangabad_highres --shadow --record --save-images --vtx --vtx-sink fb+mjpeg --connection /dev/ttyACM0:115200 --camera /dev/video0
+
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+
+StandardOutput=append:/home/admin/VPS/logs/shadow_console.log
+StandardError=append:/home/admin/VPS/logs/shadow_console.log
+SyslogIdentifier=vps-nav
+
+[Install]
+WantedBy=multi-user.target
+

@@ -271,8 +271,8 @@ class MAVLinkBridge:
                 alt = float(msg.alt)
                 if self._baro_ground_offset is None:
                     self._baro_ground_offset = alt
-                # If relative altitude from GLOBAL_POSITION_INT is not active, use tared baro
-                if self._home_lat_deg is None and not self._has_local_pos_ned:
+                # Keep relative baro updated whenever GLOBAL_POSITION_INT is not providing it
+                if self._home_lat_deg is None or self._has_local_pos_ned:
                     self._latest_baro = alt - self._baro_ground_offset
             else:
                 continue

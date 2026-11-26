@@ -271,12 +271,18 @@ class MapMatcher:
             v2 = v1 + pad_h
 
             if u1 < 0 or v1 < 0 or u2 > w_tile or v2 > h_tile:
-                # Outside tile bounds
-                continue
-
-            tile_sub = np.float32(tile_grad[v1:v2, u1:u2])
-            if tile_sub.shape != live_float.shape:
-                continue
+                # Tile seam near prior: extract overlapping intersection padded to live shape
+                c_u1, c_v1 = max(0, u1), max(0, v1)
+                c_u2, c_v2 = min(w_tile, u2), min(h_tile, v2)
+                if (c_u2 - c_u1) < int(0.5 * pad_w) or (c_v2 - c_v1) < int(0.5 * pad_h):
+                    continue
+                tile_sub = np.zeros((pad_h, pad_w), dtype=np.float32)
+                dx1, dy1 = c_u1 - u1, c_v1 - v1
+                tile_sub[dy1 : dy1 + (c_v2 - c_v1), dx1 : dx1 + (c_u2 - c_u1)] = tile_grad[c_v1:c_v2, c_u1:c_u2]
+            else:
+                tile_sub = np.float32(tile_grad[v1:v2, u1:u2])
+                if tile_sub.shape != live_float.shape:
+                    continue
 
             # Run FFT Phase Correlation
             shift, response = cv2.phaseCorrelate(tile_sub, live_float, hann)

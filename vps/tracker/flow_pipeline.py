@@ -35,6 +35,7 @@ class FlowPipelineResult:
     processing_time_ms: float
     rolling_fps: float
     status_code: str
+    tracked_points: Optional[np.ndarray] = None
 
 
 class VisionHeightPipeline:
@@ -174,6 +175,10 @@ class VisionHeightPipeline:
         median_flow_px = track_res.median_flow_px
         status_msg = status.reason
 
+        inlier_pts_c: Optional[np.ndarray] = None
+        if track_res.num_inliers > 0:
+            inlier_pts_c = track_res.pts_curr[track_res.inlier_mask]
+
         # Step 4: If baseline threshold reached, compute height-from-flow
         if status.should_estimate_height and track_res.num_inliers >= 8:
             # Inter-frame camera rotation R_k2c
@@ -182,7 +187,6 @@ class VisionHeightPipeline:
             R_cam_rel = self.R_b2c @ (R_w_b1.T @ R_w_b0) @ self.R_c2b
 
             inlier_pts_k = track_res.pts_prev[track_res.inlier_mask]
-            inlier_pts_c = track_res.pts_curr[track_res.inlier_mask]
 
             # De-rotate optical flow
             _, flow_trans = self.derot_engine.compute_translational_flow(
@@ -232,6 +236,7 @@ class VisionHeightPipeline:
             processing_time_ms=t_elapsed,
             rolling_fps=self.rolling_fps,
             status_code=status_msg,
+            tracked_points=inlier_pts_c,
         )
 
     def _record_latency(self, elapsed_ms: float) -> None:

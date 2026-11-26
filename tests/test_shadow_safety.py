@@ -309,3 +309,62 @@ def test_mavlink_bridge_parse_serial_connection_string():
     assert MAVLinkBridge.parse_connection_string("/dev/ttyAMA0", 921600) == ("/dev/ttyAMA0", 921600)
     assert MAVLinkBridge.parse_connection_string("COM4:115200", 57600) == ("COM4", 115200)
     assert MAVLinkBridge.parse_connection_string("udpin:127.0.0.1:14550", 921600) == ("udpin:127.0.0.1:14550", 921600)
+
+
+def test_shadow_p2_cli_preserves_safety_and_enables_phase2(monkeypatch):
+    """Verify --shadow enables both Phase 1 & Phase 2 while keeping observe-only safety, and --phase1-only limits to Phase 1."""
+    import sys
+    import vps.main as vps_main
+
+    monkeypatch.setattr(sys, "argv", ["vps.main", "--shadow", "--camera", "mock"])
+    args = vps_main.parse_arguments()
+    is_shadow, phase1_only, record_session = vps_main._resolve_operational_flags(args)
+
+    assert is_shadow is True
+    assert phase1_only is False
+    assert record_session is True
+
+    monkeypatch.setattr(sys, "argv", ["vps.main", "--shadow", "--phase1-only", "--camera", "mock"])
+    args_p1 = vps_main.parse_arguments()
+    is_shadow_p1, p1_only, rec_p1 = vps_main._resolve_operational_flags(args_p1)
+    assert is_shadow_p1 is True
+    assert p1_only is True
+    assert rec_p1 is True
+
+    cfg = VPSConfig(mode="shadow", mavlink=MAVLinkConfig(feed_fc_ekf=False))
+    app = vps_main.VPSApplication(config=cfg, phase1_only=phase1_only, record_session=False)
+    assert app.cfg.mode == "shadow"
+    assert app.phase1_only is False
+    assert app.mavlink_bridge.mode == "shadow"
+
+
+def test_distance_sensor_preserves_mavlink2_signature_under_chokepoint():
+    """Verify chokepoint proxy wrapping preserves DistanceSensorSender MAVLink 2 signature detection."""
+    class Mav2Conn:
+        def __init__(self):
+            self.mav = self
+            self.target_system = 1
+            self.target_component = 1
+
+        def distance_sensor_send(
+            self,
+            time_boot_ms,
+            min_distance,
+            max_distance,
+            current_distance,
+            type,
+            id,
+            orientation,
+            covariance,
+            horizontal_fov=0.0,
+            vertical_fov=0.0,
+            quaternion=None,
+            signal_quality=0,
+        ):
+            pass
+
+    conn = Mav2Conn()
+    chokepoint = ShadowMAVLinkSafetyChokepoint(mav_connection=conn, mode="flight")
+    sender = DistanceSensorSender(mav_connection=conn, chokepoint=chokepoint)
+    assert sender._supports_mavlink2 is True
+

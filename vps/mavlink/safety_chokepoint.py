@@ -23,6 +23,7 @@ SAFETY GUARDS:
 """
 
 from typing import Optional, Dict, Any, Callable, Set, List
+import functools
 import logging
 import threading
 import time
@@ -109,6 +110,7 @@ class ShadowMAVLinkSafetyChokepoint:
             orig_raw_send = mav_obj.send
 
             def make_raw_wrapper(fn: Callable):
+                @functools.wraps(fn)
                 def raw_send_wrapper(msg, *args, **kwargs):
                     msg_type = getattr(msg, "get_type", lambda: "")() or getattr(msg, "name", "")
                     clean_type = str(msg_type).upper().strip()
@@ -144,6 +146,7 @@ class ShadowMAVLinkSafetyChokepoint:
                 orig_fn = getattr(mav_obj, method_name)
 
                 def make_wrapper(m_type: str, fn: Callable):
+                    @functools.wraps(fn)
                     def wrapper(*args, **kwargs):
                         return self.send_intercepted(m_type, fn, *args, **kwargs)
                     return wrapper
